@@ -44,6 +44,7 @@
 #include "io.h"
 #include "exec.h"
 #include "state.h"
+#include "lcd.h"
 #include "emu.h"
 
 #include <avr/wdt.h>
@@ -95,6 +96,15 @@ int main(int argc, char *argv[]) {
     modbus_callback();            // handle modbus events
     io_callback();                // handle io input
     report_callback();            // report changes
+    lcd_callback();               // LCD splash, once, at ~1s (AVR-9)
+
+    // AVR-4: feed the watchdog only here, after a full pass through all
+    // the periodic work above.  Reaching this point proves the main loop
+    // is alive; a deadlock in any callback stops the feeding and the
+    // watchdog resets the controller instead of leaving it hung with
+    // spindle and motor outputs in their last state.  The watchdog must
+    // never be fed from an interrupt (see rtc.c).
+    wdt_reset();
   }
 
   return 0;

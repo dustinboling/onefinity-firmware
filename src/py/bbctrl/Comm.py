@@ -88,7 +88,9 @@ class Comm(object):
 
 
     def i2c_command(self, cmd, byte = None, word = None, block = None):
-        self.log.info('I2C: %s b=%s w=%s d=%s' % (cmd, byte, word, block))
+        # P-10: debug, formatted only when enabled (see AVR._i2c_write)
+        if bbctrl.log.debug_enabled(self.log):
+            self.log.debug('I2C: %s b=%s w=%s d=%s' % (cmd, byte, word, block))
         self.avr.i2c_command(cmd, byte, word, block)
 
 
@@ -96,7 +98,10 @@ class Comm(object):
 
 
     def _load_next_command(self, cmd):
-        self.log.info('< ' + json.dumps(cmd).strip('"'))
+        # P-10: json.dumps per command was on the motion hot path at
+        # INFO; serialise only when debug is enabled.
+        if bbctrl.log.debug_enabled(self.log):
+            self.log.debug('< ' + json.dumps(cmd).strip('"'))
         self.command = bytes(cmd.strip() + '\n', 'utf-8')
 
 
@@ -196,18 +201,40 @@ class Comm(object):
         self._log_motor_flags(update)
 
 
-    def _read(self, data):
-        self.in_buf += data.decode('utf-8')
+    # P-12: a serial line longer than this without a newline is a
+    # faulting AVR/noise, not a report: drop it and resync instead of
+    # buffering without bound.
+    MAX_LINE = 64 * 1024
 
-        # Parse incoming serial data into lines
-        while True:
-            i = self.in_buf.find('\n')
-            if i == -1: break
-            line = self.in_buf[0:i].strip()
-            self.in_buf = self.in_buf[i + 1:]
+    def _read(self, data):
+        # errors='replace': one noise byte or a multi-byte sequence split
+        # across chunks used to raise and discard the whole chunk,
+        # including complete state reports in it.
+        self.in_buf += data.decode('utf-8', errors = 'replace')
+
+        if '\n' not in self.in_buf:
+            if len(self.in_buf) > self.MAX_LINE:
+                self.log.warning('Serial: dropping %d bytes with no newline',
+                                 len(self.in_buf))
+                self.in_buf = ''
+            return
+
+        # Split in one pass; repeated slicing copied the remainder per
+        # line (quadratic on a busy link).
+        parts = self.in_buf.split('\n')
+        self.in_buf = parts.pop() # trailing partial line
+        if len(self.in_buf) > self.MAX_LINE:
+            self.log.warning('Serial: dropping over-long partial line')
+            self.in_buf = ''
+
+        for raw in parts:
+            line = raw.strip()
 
             if line:
-                self.log.info('> ' + line)
+                # P-10: every AVR report line at INFO + a file flush
+                # was self-inflicted jitter in the serial loop.
+                if bbctrl.log.debug_enabled(self.log):
+                    self.log.debug('> ' + line)
 
                 try:
                     msg = json.loads(line)

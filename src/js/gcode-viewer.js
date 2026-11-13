@@ -71,7 +71,7 @@ module.exports = {
         return;
       }
 
-      const response = await fetch(`/api/file/${file}`, { cache: "no-cache" });
+      const response = await fetch(`/api/file/${encodeURIComponent(file)}`, { cache: "no-cache" });
       const text = await response.text();
 
       if (text.length > 20e6) {

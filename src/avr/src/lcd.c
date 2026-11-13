@@ -129,15 +129,24 @@ void _splash(uint8_t addr) {
 
 
 void lcd_splash() {
-  wdt_disable();
+  // AVR-9: this runs in main-loop context now, so the watchdog stays
+  // enabled throughout.  Each _splash() takes ~160ms of busy delays,
+  // under the 250ms watchdog period; feed the watchdog between the two
+  // displays so the bounded splash cannot trip it.
   _splash(0x27);
+  wdt_reset();
   _splash(0x3f);
-  wdt_enable(WDTO_250MS);
 }
 
 
-void lcd_rtc_callback() {
-  // Display the splash if we haven't gotten any commands in 1sec since boot
-  if (!command_is_active() && rtc_get_time() == 1000)
-    lcd_splash();
+void lcd_callback() {
+  // Display the splash if we haven't gotten any commands in 1sec since
+  // boot.  Called from the main loop (AVR-9); the old version ran the
+  // splash from the RTC ISR.  Runs at most once.
+  static bool done = false;
+
+  if (done || rtc_get_time() < 1000) return;
+  done = true;
+
+  if (!command_is_active()) lcd_splash();
 }

@@ -37,7 +37,7 @@ should_resize_root_partition() {
 
     if [ "$ROOT_PART_END" -gt "$TARGET_END" ]; then
         FAIL_REASON="Root partition runs past the end of device"
-        echo $FAIL_REASON
+        echo "$FAIL_REASON"
         return 1
     fi
 
@@ -53,14 +53,30 @@ should_resize_root_partition() {
 }
 
 if should_resize_root_partition; then
-    grep "init_resize" /boot/cmdline.txt >/dev/null
-    if [ $? -ne 0 ]; then
+    if ! grep -q "init_resize" /boot/cmdline.txt; then
         # On the next boot, init_resize.sh will:
         #   Resize the root partition to use the rest of the SD card
         #   Remove itself from /boot/cmdline.txt
         #   Reboot the machine
+        #
+        # /boot is normally read-only so power loss cannot corrupt
+        # it; remount it read-write only for this edit, sync, and
+        # always remount it read-only again -- the EXIT trap covers
+        # failure paths too (audit Scripts-17).
+        BOOT_RW=false
+        remount_boot_ro() {
+            if $BOOT_RW; then
+                sudo mount /boot -o ro,remount || true
+                BOOT_RW=false
+            fi
+        }
+        trap remount_boot_ro EXIT
         sudo mount /boot -o rw,remount
+        BOOT_RW=true
         sed -i 's/\(.*\)/\1 init=\/usr\/lib\/raspi-config\/init_resize.sh/' /boot/cmdline.txt
+        sync
+        remount_boot_ro
+        trap - EXIT
     fi
 
     # On the first boot after init_resize, resize2fs_once will:
@@ -74,6 +90,6 @@ if should_resize_root_partition; then
 
     exit 0
 else
-    echo "Not resizing root partition: $FAIL_REASON"
+    echo "Not resizing root partition: ${FAIL_REASON:-unknown}"
     exit 1
 fi

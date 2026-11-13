@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import bbctrl
 import glob
@@ -17,9 +18,35 @@ def safe_remove(path):
 
 @tornado.web.stream_request_body
 class FileHandler(bbctrl.APIHandler):
+    # P-01: deleting programs is an admin operation; uploading and
+    # downloading them is normal machine use and stays open on the LAN.
+    ADMIN_ONLY = True
+    ADMIN_METHODS = ('DELETE',)
+
+    # P-11: uploads were accepted up to 1 GiB with no disk-space or
+    # size check, on an SD card shared with plans, logs and
+    # checkpoints.  Real G-code is tens of MB at most.
+    MAX_UPLOAD_BYTES = 100 * 2 ** 20
+    MIN_FREE_AFTER = 64 * 2 ** 20
+
     def prepare(self):
+        # Not APIHandler.prepare: an upload body is not JSON.  Run only
+        # the base admin gate (P-01).
+        bbctrl.RequestHandler.prepare(self)
         if self.request.method == 'PUT':
-            self.request.connection.set_max_body_size(2 ** 30)
+            self.request.connection.set_max_body_size(
+                self.MAX_UPLOAD_BYTES + 2 ** 20)
+
+            # Refuse before spooling if the card could not hold the
+            # largest allowed upload and still keep a working reserve.
+            try:
+                free = shutil.disk_usage(
+                    self.get_upload() if os.path.exists(self.get_upload())
+                    else '.').free
+            except OSError:
+                free = None
+            if free is not None and free < self.MAX_UPLOAD_BYTES + self.MIN_FREE_AFTER:
+                raise HTTPError(507, 'Not enough free space on the controller')
 
             filename = self.request.path.split('/')[-1]
             self.uploadFilename = url_unescape(filename) \
@@ -31,10 +58,35 @@ class FileHandler(bbctrl.APIHandler):
                 .replace('?', '-')
 
             self.uploadFile = tempfile.NamedTemporaryFile("wb")
+            self._upload_bytes = 0
 
     def data_received(self, data):
         if self.request.method == 'PUT':
+            self._upload_bytes += len(data)
+            if self._upload_bytes > self.MAX_UPLOAD_BYTES:
+                # Abort the stream and drop the spooled temp file
+                # (on_finish also cleans up if this is bypassed).
+                try:
+                    name = self.uploadFile.name
+                    self.uploadFile.close()
+                    os.unlink(name)
+                except Exception: pass
+                del self.uploadFile
+                raise HTTPError(413, 'Program is too large (max %d MB)' %
+                                (self.MAX_UPLOAD_BYTES // 2 ** 20))
             self.uploadFile.write(data)
+
+
+    def on_finish(self):
+        # P-11: an exception between prepare() and put_ok() used to
+        # orphan the spooled temp file on the SD card.
+        f = getattr(self, 'uploadFile', None)
+        if f is not None:
+            try:
+                f.close()
+                os.unlink(f.name)
+            except Exception: pass
+            del self.uploadFile
 
     def delete_ok(self, filename):
         allFiles = self.get_ctrl().state.return_files()
@@ -126,8 +178,14 @@ class FileHandler(bbctrl.APIHandler):
             filebasename = os.path.basename(url_unescape(filename))
         
         try:
-            with open(self.get_upload(filebasename).encode('utf8'), 'r') as f:
-                self.write(f.read())
+            # P-09: stream the program out in chunks instead of reading
+            # it whole into RAM on the IOLoop.
+            with open(self.get_upload(filebasename).encode('utf8'), 'rb') as f:
+                while True:
+                    chunk = f.read(1024 * 64)
+                    if not chunk: break
+                    self.write(chunk)
+                    yield self.flush()
         except Exception:
             self.get_ctrl().state.select_file('')
             raise HTTPError(

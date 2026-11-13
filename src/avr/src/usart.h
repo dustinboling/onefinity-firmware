@@ -83,6 +83,8 @@ void usart_init_port(USART_t *port, baud_t baud, parity_t parity, bits_t bits,
 
 void usart_init();
 void usart_putc(char c);
+bool usart_try_putc(char c);
+bool usart_try_puts(const char *s);
 void usart_puts(const char *s);
 int8_t usart_getc();
 char *usart_readline();

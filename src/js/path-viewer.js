@@ -133,8 +133,8 @@ module.exports = {
 
             try {
                 const [ positions, speeds ] = await Promise.all([
-                    get_floats(`/api/path/${filename}/positions`),
-                    get_floats(`/api/path/${filename}/speeds`)
+                    get_floats(`/api/path/${encodeURIComponent(filename)}/positions`),
+                    get_floats(`/api/path/${encodeURIComponent(filename)}/speeds`)
                 ]);
 
                 if (filename != this.toolpath.filename) return; // Superseded
@@ -175,8 +175,8 @@ module.exports = {
             }
 
             const [ positions, speeds ] = await Promise.all([
-                get_floats(`/api/path/${this.toolpath.filename}/positions`),
-                get_floats(`/api/path/${this.toolpath.filename}/speeds`)
+                get_floats(`/api/path/${encodeURIComponent(this.toolpath.filename)}/positions`),
+                get_floats(`/api/path/${encodeURIComponent(this.toolpath.filename)}/speeds`)
             ]);
 
             this.positions = positions;

@@ -36,6 +36,7 @@
 #include "pgmspace.h"
 #include "state.h"
 #include "exec.h"
+#include "seek.h"
 #include "base64.h"
 #include "rtc.h"
 #include "stepper.h"
@@ -151,6 +152,11 @@ void command_print_json() {
 
 
 void command_flush_queue() {
+  // AVR-3: a stall seek that already executed switched one motor to
+  // stall microsteps; flushing the queue must restore it (a seek still
+  // only queued never switched anything, so this is then a no-op).
+  seek_cancel();
+
   sync_q_init();
   cmd.count = 0;
   command_reset_position();
@@ -207,6 +213,10 @@ bool command_callback() {
 
 
 void command_set_axis_position(int axis, const float p) {
+  // AVR-2: cmd.position[] has AXES entries; refuse out-of-range axes
+  // (axis_get_id() returns 6..8 for U/V/W) instead of corrupting the
+  // neighbouring queue state.
+  if (axis < 0 || AXES <= axis) return;
   cmd.position[axis] = p;
 }
 

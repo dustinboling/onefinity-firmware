@@ -30,12 +30,10 @@
 #include "switch.h"
 #include "analog.h"
 #include "motor.h"
-#include "lcd.h"
 #include "vfd_spindle.h"
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <avr/wdt.h>
 
 #include <string.h>
 
@@ -46,12 +44,18 @@ static uint32_t ticks;
 ISR(RTC_OVF_vect) {
   ticks++;
 
-  lcd_rtc_callback();
+  // AVR-4: the watchdog is deliberately NOT fed here.  An ISR keeps
+  // running while the main loop is deadlocked, so feeding it here made
+  // the watchdog useless.  It is fed only from the main loop (main.c),
+  // after each pass through the periodic work.
+  // AVR-9: no LCD work here either.  The old lcd_rtc_callback() ran the
+  // ~300ms splash screen, with busy delays and the watchdog disabled,
+  // inside this ISR and ahead of switch debouncing.  The splash is now
+  // requested via lcd_callback() from the main loop.
   switch_rtc_callback();
   analog_rtc_callback();
   vfd_spindle_rtc_callback();
   if (!(ticks & 255)) motor_rtc_callback();
-  wdt_reset();
 }
 
 

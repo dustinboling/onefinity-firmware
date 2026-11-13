@@ -44,21 +44,29 @@
 
 typedef struct {
   // Runtime
-  bool busy;
-  bool requesting;
-  float dwell;
-  uint8_t power_buf;
-  uint8_t power_index;
+  // AVR-12: the scalar fields below are shared between the HI step
+  // timer ISR, the LO exec ISR and the main loop.  They are volatile so
+  // the compiler cannot cache them in registers across those contexts;
+  // multi-byte fields are additionally read/written under ATOMIC_BLOCK
+  // at the access points (get_dwell_time(), get_underrun()).
+  volatile bool busy;
+  volatile bool requesting;
+  volatile float dwell;
+  volatile uint8_t power_buf;
+  volatile uint8_t power_index;
 
   // Move prep
-  bool move_ready;  // Prepped move ready for loader
-  bool move_queued; // Prepped move queued
-  float prep_dwell;
-  int8_t power_next;
+  volatile bool move_ready;  // Prepped move ready for loader
+  volatile bool move_queued; // Prepped move queued
+  volatile float prep_dwell;
+  volatile int8_t power_next;
 
+  // Double-buffered by design: the HI ISR reads powers[power_buf] while
+  // prep fills the other buffer and only then publishes it by setting
+  // power_next (see st_prep_power()/st_prep_dwell()).
   power_update_t powers[2][POWER_MAX_UPDATES];
 
-  uint32_t underrun;
+  volatile uint32_t underrun;
 } stepper_t;
 
 
@@ -207,9 +215,16 @@ ISR(STEP_TIMER_ISR) {
 
 void st_prep_power(const power_update_t powers[]) {
   ESTOP_ASSERT(!st.move_ready, STAT_STEPPER_NOT_READY);
-  st.power_next = !st.power_buf;
-  memcpy(st.powers[st.power_next], powers,
+  // AVR-12: fill the inactive power buffer first, then publish it via
+  // the volatile power_next flag; the HI ISR keeps consuming the active
+  // buffer (power_buf) until it picks up power_next at a move boundary,
+  // so it can never observe a half-filled buffer.  (Not wrapped in
+  // ATOMIC_BLOCK on purpose: blocking the HI step interrupt for the
+  // duration of the copy would add step-timing jitter.)
+  int8_t next = !st.power_buf;
+  memcpy(st.powers[next], powers,
          sizeof(power_update_t) * POWER_MAX_UPDATES);
+  st.power_next = next;
 }
 
 
@@ -229,15 +244,24 @@ void st_prep_line(const float target[]) {
 void st_prep_dwell(float seconds) {
   ESTOP_ASSERT(!st.move_ready, STAT_STEPPER_NOT_READY);
   if (seconds <= 1e-4) seconds = 1e-4; // Min dwell
-  st.power_next = !st.power_buf;
-  spindle_load_power_updates(st.powers[st.power_next], 0, 0);
+  // AVR-12: as in st_prep_power(), fill the inactive buffer first and
+  // publish it last via the volatile power_next flag.
+  int8_t next = !st.power_buf;
+  spindle_load_power_updates(st.powers[next], 0, 0);
+  st.power_next = next;
   st.prep_dwell = seconds;
   st.move_queued = true; // signal prep buffer ready
 }
 
 
 // Var callbacks
-uint32_t get_underrun() {return st.underrun;}
+uint32_t get_underrun() {
+  // AVR-12: 32-bit counter incremented in the LO ISR; snapshot it
+  // atomically for the main-loop var reader.
+  uint32_t underrun;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) underrun = st.underrun;
+  return underrun;
+}
 
 
 float get_dwell_time() {

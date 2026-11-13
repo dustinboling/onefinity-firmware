@@ -25,7 +25,9 @@
 #                                                                              #
 ################################################################################
 
+import queue
 import serial
+import threading
 import time
 import traceback
 import ctypes
@@ -78,6 +80,16 @@ class AVR(object):
         self.i2c_addr = ctrl.args.avr_addr
         self.read_cb = None
         self.write_cb = None
+
+        # P-05: I2C writes run on a dedicated worker thread.  They used
+        # to retry with time.sleep() on the Tornado IOLoop, stalling the
+        # whole server (heartbeats, the jog watchdog, further stop
+        # commands) for up to ~2.5 s per command exactly when the bus
+        # was faulting.  Motion-critical commands (estop/pause/stop/
+        # clear/unpause) jump the queue; retries happen on the worker.
+        self._i2c_queue = queue.PriorityQueue()
+        self._i2c_seq = 0
+        self._i2c_thread = None
 
 
     def close(self): pass
@@ -139,8 +151,40 @@ class AVR(object):
             self.log.warning('Serial handler error: %s', traceback.format_exc())
 
 
+    # Motion-critical I2C commands, by command letter (see Cmd.py):
+    # ESTOP, PAUSE, STOP, CLEAR, UNPAUSE.
+    _I2C_CRITICAL = 'EPSCU'
+
     def i2c_command(self, cmd, byte = None, word = None, block = None):
-        self.log.info('I2C: %s b=%s w=%s d=%s' % (cmd, byte, word, block))
+        # P-05: never blocks the caller (the IOLoop).  The write, and
+        # any retries, happen on the I2C worker thread; a command that
+        # ultimately fails is logged there.  Callers never depended on
+        # the old raise-after-2.5 s behaviour to act.
+        if self._i2c_thread is None:
+            self._i2c_thread = threading.Thread(
+                target = self._i2c_worker, name = 'i2c', daemon = True)
+            self._i2c_thread.start()
+
+        priority = 0 if cmd[0] in self._I2C_CRITICAL else 1
+        self._i2c_seq += 1
+        self._i2c_queue.put((priority, self._i2c_seq,
+                             (cmd, byte, word, block)))
+
+
+    def _i2c_worker(self):
+        while True:
+            _, _, (cmd, byte, word, block) = self._i2c_queue.get()
+            try:
+                self._i2c_write(cmd, byte, word, block)
+            except Exception:
+                self.log.exception('I2C worker error')
+            finally:
+                self._i2c_queue.task_done()
+
+
+    def _i2c_write(self, cmd, byte, word, block):
+        if bbctrl.log.debug_enabled(self.log):
+            self.log.debug('I2C: %s b=%s w=%s d=%s' % (cmd, byte, word, block))
         retry = 10
         cmd = ord(cmd[0])
 
@@ -154,9 +198,9 @@ class AVR(object):
 
                 if retry:
                     self.log.warning('I2C failed, retrying: %s' % e)
-                    time.sleep(0.25)
+                    time.sleep(0.25) # on the I2C worker thread, not the IOLoop
                     continue
 
                 else:
                     self.log.error('I2C failed: %s' % e)
-                    raise
+                    break

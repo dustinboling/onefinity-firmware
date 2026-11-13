@@ -216,7 +216,9 @@ static char *_resolve_name(const char *_name) {
   // Handle axis to motor mapping
   if (2 < len && name[1] == '.') {
     int axis = axis_get_id(name[0]);
-    if (axis < 0) return 0;
+    // AVR-2: reject U/V/W (ids 6..8) here too; axis_get_motor() also
+    // bounds-checks, this keeps the intent explicit at the call site.
+    if (axis < 0 || AXES <= axis) return 0;
     int motor = axis_get_motor(axis);
     if (motor < 0) return 0;
 
@@ -273,7 +275,7 @@ static type_u _get(type_t type, int8_t index, get_cb_u cb) {
 #define TYPEDEF(TYPE, ...)                                              \
     case TYPE_##TYPE:                                                   \
       if (index == -1) value._##TYPE = cb.get_##TYPE();                 \
-      value._##TYPE = cb.get_##TYPE##_index(index);                     \
+      else value._##TYPE = cb.get_##TYPE##_index(index);                \
       break;
 #include "type.def"
 #undef TYPEDEF

@@ -46,9 +46,11 @@ export default function Files({ state, cfg, idle }) {
   const upload = async (list, folderName) => {
     setErr("");
     const files = [...list];
-    const good = files.filter((f) => OK_EXT.includes(f.name.split(".").pop().toLowerCase()));
+    // A comma in a name cannot be represented in the comma-joined delete/download lists
+    // the controller API uses, so such files are refused here rather than mishandled later.
+    const good = files.filter((f) => !f.name.includes(",") && OK_EXT.includes(f.name.split(".").pop().toLowerCase()));
     const bad = files.filter((f) => !good.includes(f));
-    if (bad.length) setErr(`Skipped ${bad.map((f) => f.name).join(", ")}. Programs must end in .nc, .ngc, .gcode or .gc.`);
+    if (bad.length) setErr(`Skipped ${bad.map((f) => f.name).join(", ")}. Programs must end in .nc, .ngc, .gcode or .gc, and file names can't contain commas.`);
     const done = [];
     for (let i = 0; i < good.length; i++) {
       setBusy(`Uploading ${i + 1} of ${good.length}: ${good[i].name}`);
@@ -81,7 +83,7 @@ export default function Files({ state, cfg, idle }) {
     const keep = macroFiles;
     const del = list.filter((n) => !keep.includes(n));
     try {
-      if (del.length) await api.del(`file/${DELETE_LIST_PREFIX}${del.join(",")}`);
+      if (del.length) await api.del(`file/${DELETE_LIST_PREFIX}${del.map((n) => encodeURIComponent(n)).join(",")}`);
       await cfg.saveLists((c) => {
         c.non_macros_list = (c.non_macros_list || []).filter((x) => !list.includes(x.file_name));
         for (const f of c.gcode_list || []) f.files = f.files.filter((x) => !list.includes(x.file_name));
@@ -105,7 +107,7 @@ export default function Files({ state, cfg, idle }) {
     try {
       if (withFiles && target) {
         const del = target.files.map((f) => f.file_name).filter((n) => !macroFiles.includes(n));
-        if (del.length) await api.del(`file/${DELETE_LIST_PREFIX}${del.join(",")}`);
+        if (del.length) await api.del(`file/${DELETE_LIST_PREFIX}${del.map((n) => encodeURIComponent(n)).join(",")}`);
       }
       await cfg.saveLists((c) => {
         const t = c.gcode_list.find((f) => f.name === folder);

@@ -1,27 +1,243 @@
 #!/bin/bash
+#
+# update-bbctrl -- install a staged firmware update package.
+#
+# The package is expected at /var/lib/bbctrl/firmware/update.tar.bz2
+# (placed there by the web upload endpoint or by upgrade-bbctrl).
+#
+# Safety properties (audit findings Scripts-1, 3, 4, 5, 16):
+#   * The whole run is serialised with flock; a second updater refuses
+#     to run instead of racing the first one (Scripts-16).
+#   * The package's integrity is verified before anything is extracted
+#     or executed: an internal SHA256SUMS manifest must be present and
+#     must match the extracted files, a sidecar .sha256 (written by
+#     upgrade-bbctrl from the GitHub release asset digest) must match
+#     when present, and a detached signature must verify when present.
+#     If a verification public key has been baked into this install
+#     (BBCTRL_UPDATE_PUBKEY, default path below) a valid signature --
+#     on the archive, or on its internal manifest -- is *required*:
+#     verification fails closed.
+#   * The archive is validated member by member and extracted with
+#     safe options into a private staging directory; hostile members
+#     (absolute paths, "..", device nodes, escaping links) are
+#     rejected before extraction (Scripts-4).
+#   * install.sh's exit status is propagated, its stderr goes to the
+#     log, and the update package is only deleted after the new
+#     install has completed *and* the bbctrl service is verified
+#     running.  On any failure the package is kept so the install can
+#     be retried (Scripts-3, 5).
+#
+# What the integrity checks do and do not prove: the SHA256SUMS
+# manifest and the sidecar digest prove the package was not corrupted
+# or substituted after the digest was recorded (for downloads, the
+# digest comes from the GitHub API over HTTPS, independently of the
+# download itself).  Only a detached signature verified against a
+# baked-in public key proves *authorship*; releases should publish
+# update.tar.bz2.sig (openssl Ed25519 or minisign) and installers
+# should ship the matching public key at BBCTRL_UPDATE_PUBKEY.
 
-(
-    flock -n 9
+set -euo pipefail
 
-    UPDATE=/var/lib/bbctrl/firmware/update.tar.bz2
+UPDATE=/var/lib/bbctrl/firmware/update.tar.bz2
+LOCK_FILE=/var/lock/bbctrl.update.lock
+PUBKEY="${BBCTRL_UPDATE_PUBKEY:-/usr/local/share/bbctrl/update-pubkey.pem}"
 
-    if [ ! -e "$UPDATE" ]; then
-      echo "Missing $UPDATE"
-      exit 1
+log()  { echo "update-bbctrl: $*"; }
+fail() { echo "update-bbctrl: ERROR: $*" >&2; exit 1; }
+
+# --- Serialise: one updater at a time (Scripts-16) -------------------
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    fail "another firmware update is already in progress"
+fi
+
+[ -e "$UPDATE" ] || fail "Missing $UPDATE"
+
+LOG="/var/log/bbctrl.$(date +%Y%m%d-%H%M%S).install"
+
+STAGE=""
+cleanup_stage() {
+    if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+        rm -rf "$STAGE"
+    fi
+}
+trap cleanup_stage EXIT
+
+# --- Integrity verification (Scripts-1) -------------------------------
+
+# verify_detached_signature <file> <sigfile> <pubkey>
+verify_detached_signature() {
+    local file="$1" sig="$2" key="$3"
+    [ -e "$key" ] || fail "signature $sig present but no verification key at $key"
+    if grep -q "BEGIN PUBLIC KEY" "$key"; then
+        # OpenSSL Ed25519 detached raw signature
+        openssl pkeyutl -verify -pubin -inkey "$key" -rawin \
+            -in "$file" -sigfile "$sig" >/dev/null 2>&1 \
+            || fail "signature verification failed for $file"
+    elif command -v minisign >/dev/null 2>&1; then
+        minisign -Vm "$file" -x "$sig" -p "$key" >/dev/null \
+            || fail "signature verification failed for $file"
+    else
+        fail "cannot verify $sig: key is not an OpenSSL public key and minisign is not installed"
+    fi
+    log "signature verified for $file"
+}
+
+ARCHIVE_SIG_VERIFIED=false
+
+verify_update_package() {
+    local file="$1"
+
+    # Corruption check (authenticity is covered by digest/signature)
+    bzip2 -t "$file" || fail "$file is not a valid bzip2 archive"
+
+    # Sidecar digest, e.g. written by upgrade-bbctrl from the GitHub
+    # release asset digest.  Only the hash field is compared; the
+    # recorded file name is informational.
+    if [ -e "$file.sha256" ]; then
+        local expected actual
+        expected="$(awk 'NR == 1 {print $1}' "$file.sha256")"
+        [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] \
+            || fail "$file.sha256 does not contain a SHA-256 digest"
+        actual="$(sha256sum "$file" | awk '{print $1}')"
+        [ "${expected,,}" = "${actual,,}" ] \
+            || fail "SHA-256 mismatch for $file (expected $expected, got $actual)"
+        log "SHA-256 digest verified for $file"
     fi
 
-    systemctl stop bbctrl
+    # Detached signature sidecar on the archive itself
+    if [ -e "$file.sig" ]; then
+        verify_detached_signature "$file" "$file.sig" "$PUBKEY"
+        ARCHIVE_SIG_VERIFIED=true
+    elif [ -e "$PUBKEY" ]; then
+        # A key baked into this install means release signing is in
+        # effect and the package must carry a valid signature
+        # somewhere in the chain (fail closed).  There is no archive
+        # signature, so a *signed* SHA256SUMS manifest is required
+        # instead; that is enforced after extraction, before any
+        # package code runs (see below).
+        log "no archive signature; requiring a signed SHA256SUMS manifest"
+    fi
+}
 
-    rm -rf /tmp/update
-    mkdir /tmp/update
-    cd /tmp/update
+# --- Safe extraction (Scripts-4) --------------------------------------
 
-    LOG=/var/log/bbctrl.$(date +%Y%m%d-%H%M%S).install
-    tar xf "$UPDATE"
-    cd *
-    ./scripts/install.sh "$*" 2>&1 > $LOG
+# Reject absolute / traversing members, device/fifo nodes and links
+# that point outside the extraction root, before tar ever runs.
+validate_archive_members() {
+    local file="$1"
+    python3 - "$file" <<'PYEOF'
+import sys, tarfile, posixpath
 
-    cd -
-    rm -rf /tmp/update $UPDATE
+path = sys.argv[1]
+try:
+    tf = tarfile.open(path, 'r:bz2')
+except Exception as e:
+    sys.exit('cannot read archive %s: %s' % (path, e))
 
-) 9> /var/lock/bbctrl.update.lock
+problems = []
+for m in tf.getmembers():
+    name = m.name
+    if name.startswith('/') or name.startswith('\\'):
+        problems.append('absolute member path: %r' % name)
+    parts = [p for p in name.split('/') if p not in ('', '.')]
+    if '..' in parts:
+        problems.append('member path escapes extraction root: %r' % name)
+    if m.isdev() or m.isfifo():
+        problems.append('device/fifo member not allowed: %r' % name)
+    if m.issym() or m.islnk():
+        target = m.linkname
+        if target.startswith('/'):
+            problems.append('link with absolute target: %r -> %r' % (name, target))
+        else:
+            resolved = posixpath.normpath(
+                posixpath.join(posixpath.dirname(name), target))
+            if resolved.startswith('..'):
+                problems.append('link escapes extraction root: %r -> %r'
+                                % (name, target))
+
+if problems:
+    for p in problems:
+        print('update-bbctrl: unsafe archive member: %s' % p, file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+verify_update_package "$UPDATE"
+validate_archive_members "$UPDATE" \
+    || fail "archive member validation failed for $UPDATE"
+
+systemctl stop bbctrl || true
+
+STAGE="$(mktemp -d /tmp/bbctrl-update.XXXXXXXX)"
+tar --no-same-owner --no-same-permissions --delay-directory-restore \
+    -xjf "$UPDATE" -C "$STAGE"
+
+# Require exactly one top-level directory, entered by name (never `cd *`)
+shopt -s nullglob dotglob
+entries=("$STAGE"/*)
+shopt -u dotglob
+[ "${#entries[@]}" -eq 1 ] \
+    || fail "update package must contain exactly one top-level directory"
+[ -d "${entries[0]}" ] \
+    || fail "update package must contain exactly one top-level directory"
+PKG_DIR="${entries[0]}"
+[ -f "$PKG_DIR/scripts/install.sh" ] \
+    || fail "update package has no scripts/install.sh"
+
+# The package must carry an internal integrity manifest covering every
+# file in it (produced by `make pkg`); verify the extracted tree
+# against it before any of its code runs (Scripts-1).
+[ -f "$PKG_DIR/SHA256SUMS" ] \
+    || fail "update package has no SHA256SUMS manifest; refusing to install"
+if [ -e "$PUBKEY" ] && ! $ARCHIVE_SIG_VERIFIED; then
+    # No verified archive signature: the manifest itself must be
+    # signed (fail closed when a key is baked in).
+    [ -f "$PKG_DIR/SHA256SUMS.sig" ] \
+        || fail "update package manifest is unsigned but a verification key is installed; refusing"
+    verify_detached_signature "$PKG_DIR/SHA256SUMS" "$PKG_DIR/SHA256SUMS.sig" "$PUBKEY"
+elif [ -f "$PKG_DIR/SHA256SUMS.sig" ] && [ -e "$PUBKEY" ]; then
+    # A signed manifest is verified whenever one is provided and a
+    # key is available, even if the archive was already signed.
+    verify_detached_signature "$PKG_DIR/SHA256SUMS" "$PKG_DIR/SHA256SUMS.sig" "$PUBKEY"
+fi
+(cd "$PKG_DIR" && sha256sum -c --quiet SHA256SUMS) \
+    || fail "update package contents do not match its SHA256SUMS manifest"
+log "package contents verified against SHA256SUMS"
+
+# --- Install, propagate the result, verify before cleanup (Scripts-3, 5)
+INSTALL_RC=0
+(cd "$PKG_DIR" && ./scripts/install.sh "$@") >"$LOG" 2>&1 || INSTALL_RC=$?
+if [ "$INSTALL_RC" -ne 0 ]; then
+    echo "update-bbctrl: install.sh failed with status $INSTALL_RC; see $LOG" >&2
+    tail -n 20 "$LOG" >&2 || true
+    echo "update-bbctrl: update package kept at $UPDATE for retry" >&2
+    exit "$INSTALL_RC"
+fi
+
+# install.sh restarts the service; make sure it actually came up
+# before the update is considered successful.
+SERVICE_OK=false
+for _ in $(seq 1 30); do
+    if systemctl is-active --quiet bbctrl; then
+        SERVICE_OK=true
+        break
+    fi
+    sleep 1
+done
+if ! $SERVICE_OK; then
+    echo "update-bbctrl: bbctrl service is not running after install; see $LOG" >&2
+    echo "update-bbctrl: update package kept at $UPDATE for retry" >&2
+    exit 1
+fi
+
+log "install verified; bbctrl service is running (log: $LOG)"
+
+# Only now -- the new version is installed and verified working -- is
+# it safe to remove the staged package (Scripts-3).
+rm -f "$UPDATE" "$UPDATE.sha256" "$UPDATE.sig"
+cleanup_stage
+STAGE=""
+sync
+
+log "Success"

@@ -194,7 +194,12 @@ uint8_t get_probe_switch() {return _get_state(SW_PROBE);}
 
 
 void set_switch_debounce(uint16_t debounce) {
-  sw.debounce = SWITCH_MAX_DEBOUNCE < debounce ? SWITCH_DEBOUNCE : debounce;
+  // AVR-15: debounce 0 was accepted, after which the per-switch counter
+  // in switch_rtc_callback() needed a full uint16_t wrap (~65s) to
+  // register any change: estop and limit switches effectively dead.
+  // Treat 0 like an over-large value and fall back to the default.
+  if (!debounce || SWITCH_MAX_DEBOUNCE < debounce) debounce = SWITCH_DEBOUNCE;
+  sw.debounce = debounce;
 }
 
 

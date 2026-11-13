@@ -20,6 +20,7 @@ export default function Jog({ state, config, send, metric, locked, idle, onProbe
   const held = useRef(null), lastTs = useRef(0);
   const [armed, setArmed] = useState(null);
   const [macroErr, setMacroErr] = useState("");
+  const [sendErr, setSendErr] = useState("");
   const stRef = useRef(state); stRef.current = state;
   // "Move to zero?" questions are shared; only the screen whose Yes is accepted first moves the machine.
   const askUi = useUi(state, "jog-ask");
@@ -35,7 +36,10 @@ export default function Jog({ state, config, send, metric, locked, idle, onProbe
   const pick = (i) => setIdx(i);
   const jog = (x, y, z, a = 0) => {
     const part = (l, d) => (d ? `${l}${+(d * amt).toFixed(4)}` : "");
-    send(`M70\nG91\n${metric ? "G21" : "G20"}\nG0 ${part("X", x)}${part("Y", y)}${part("Z", z)}${part("A", a)}\nM72`);
+    // A step jog sent while the connection is down goes nowhere: say so, or the operator
+    // believes the machine moved when it didn't.
+    if (send(`M70\nG91\n${metric ? "G21" : "G20"}\nG0 ${part("X", x)}${part("Y", y)}${part("Z", z)}${part("A", a)}\nM72`) === false) setSendErr("Not connected — that jog was not sent.");
+    else setSendErr("");
   };
 
   // Hold mode: velocity jog. The controller moves while we keep re-sending the command; if the
@@ -139,6 +143,8 @@ export default function Jog({ state, config, send, metric, locked, idle, onProbe
         </div>
       </div>
 
+      {sendErr && <p className="macro-err" role="alert">{sendErr}</p>}
+
       <div className="probes">
         <button disabled={!ready} className={probeActive(state) ? "contact" : ""} onClick={() => onProbe("xyz")}>Probe XYZ</button>
         <button disabled={!ready} className={probeActive(state) ? "contact" : ""} onClick={() => onProbe("z")}>Probe Z</button>
@@ -164,7 +170,7 @@ export default function Jog({ state, config, send, metric, locked, idle, onProbe
 
       {ask && ask !== "rotary" && (
         <Confirm title={`Move to ${ask === "xy" ? "X0 Y0" : ask === "z" ? "Z0" : "A0"}?`} confirmLabel="Move"
-          onCancel={() => setAsk(null)} onConfirm={async () => { const w = ask; if (await confirmAsk()) send(`G90\nG0 ${w === "xy" ? "X0Y0" : w === "z" ? "Z0" : "A0"}`); }}>
+          onCancel={() => setAsk(null)} onConfirm={async () => { const w = ask; if (await confirmAsk()) { if (send(`G90\nG0 ${w === "xy" ? "X0Y0" : w === "z" ? "Z0" : "A0"}`) === false) setSendErr("Not connected — the move to zero was not sent."); else setSendErr(""); } }}>
           <p>The machine will move straight there. Check that the tool is clear of clamps and stock.</p>
         </Confirm>
       )}

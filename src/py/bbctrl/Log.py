@@ -47,6 +47,21 @@ level_names = 'debug info message warning error'.split()
 def get_level_name(level): return level_names[level]
 
 
+def would_log(logger, level, default = True):
+    '''True if `logger` would emit `level`.  Safe with the minimal log
+    stubs used in tests, which may not implement the check at all.'''
+    fn = getattr(logger, 'enabled', None) or getattr(logger, '_enabled', None)
+    if fn is None: return default
+    try: return bool(fn(level))
+    except Exception: return default
+
+
+def debug_enabled(logger):
+    '''True if `logger` would emit DEBUG (used to skip formatting a
+    debug message nobody will read).'''
+    return would_log(logger, DEBUG, default = False)
+
+
 # Get this file's name
 _srcfile = os.path.normcase(get_level_name.__code__.co_filename)
 
@@ -60,6 +75,7 @@ class Logger(object):
 
     def set_level(self, level): self.level = level
     def _enabled(self, level): return self.level <= level and level <= ERROR
+    def enabled(self, level): return self._enabled(level)
 
 
     def _find_caller(self):
@@ -152,7 +168,12 @@ class Log(object):
         if self.f is not None:
             if 1e22 <= self.bytes_written + len(s) + 1: self._open()
             self.f.write(s + '\n')
-            self.f.flush()
+            # P-10: no flush per line.  This runs on the motion hot
+            # path (per G-code line / AVR report) and SD-card flush
+            # latency is spiky; the file buffer flushes as it fills.
+            # Warnings and errors still flush at once — they are rare
+            # and are exactly what must survive a crash or power cut.
+            if level >= WARNING: self.f.flush()
             self.bytes_written += len(s) + 1
 
         print(s)

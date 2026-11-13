@@ -89,9 +89,21 @@ export function loadPicture(url) {
     im.onload = () => {
       const cv = document.createElement("canvas"); cv.width = im.naturalWidth; cv.height = im.naturalHeight;
       const g = cv.getContext("2d"); g.drawImage(im, 0, 0);
-      resolve({ url, w: cv.width, h: cv.height, data: g.getImageData(0, 0, cv.width, cv.height), canvas: cv });
+      // A blob: URL (every camera still) is never released while the picture lives in
+      // state, so repeated pictures leak one full-resolution frame each. Once the canvas
+      // holds the pixels, swap the display URL for a data URL — the same JPEG form the
+      // saved empty-bed picture already uses — and revoke the blob URL.
+      let shown = url;
+      if (url.startsWith("blob:")) {
+        shown = cv.toDataURL("image/jpeg", 0.92);
+        URL.revokeObjectURL(url);
+      }
+      resolve({ url: shown, w: cv.width, h: cv.height, data: g.getImageData(0, 0, cv.width, cv.height), canvas: cv });
     };
-    im.onerror = () => reject(new Error("The camera picture could not be read."));
+    im.onerror = () => {
+      if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+      reject(new Error("The camera picture could not be read."));
+    };
     im.src = url;
   });
 }
@@ -180,6 +192,7 @@ export default function BedCam({ state, cfg, idle, send, subscribe, path, onMeas
   const fail = (e) => { setBusy(""); setMsg({ ok: false, text: typeof e === "string" ? e : errText(e) }); };
   const runOk = async (prog) => {
     const r = await run(prog);
+    if (r.notStarted) throw new Error("The program never started — the controller didn't take it, most likely because the connection dropped. Check the connection and try again.");
     if (r.estop || r.xx === "ESTOPPED") throw new Error(r.notFound ? "The probe didn't touch anything within reach, so the controller stopped with an E-stop. Clear it and start the probe closer." : "The machine was E-stopped.");
     return r;
   };

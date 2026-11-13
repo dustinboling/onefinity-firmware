@@ -57,5 +57,5 @@ void motor_load_move(int motor);
 void motor_prep_move(int motor, float target);
 
 void enable_stall_microstep(int m);
-void disable_stall_microstep();
+void disable_stall_microstep(int m);
 

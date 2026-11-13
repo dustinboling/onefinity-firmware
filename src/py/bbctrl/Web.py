@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import tornado
 import time
 import sockjs.tornado
@@ -11,11 +12,24 @@ from tornado import gen
 from tornado.escape import url_unescape
 import re
 import bbctrl
-from urllib.request import urlopen
 import iw_parse
 import io
 import zipfile
 import shutil
+
+def finite_float(value, name, lo = None, hi = None):
+    '''P-14: the one validator for numeric handler inputs.  Python's
+    json accepts NaN/Infinity, and float() of them used to flow straight
+    into G92/override commands to the AVR.  Reject non-finite and
+    out-of-range values with 400.'''
+    try: v = float(value)
+    except (TypeError, ValueError):
+        raise HTTPError(400, 'Bad %s' % name)
+    if not math.isfinite(v): raise HTTPError(400, 'Bad %s' % name)
+    if lo is not None and v < lo: raise HTTPError(400, '%s out of range' % name)
+    if hi is not None and v > hi: raise HTTPError(400, '%s out of range' % name)
+    return v
+
 
 def call_get_output(cmd):
     p = subprocess.Popen(cmd, stdout = subprocess.PIPE)
@@ -51,19 +65,28 @@ def check_password(password):
 
 
 class RebootHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def put_ok(self):
         self.get_ctrl().lcd.goodbye('Rebooting...')
         subprocess.Popen(['reboot'])
         
 class ShutdownHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def put_ok(self):
         subprocess.Popen(['shutdown','-h','now'])
 
 
 class LogHandler(bbctrl.RequestHandler):
+    # P-09: stream in chunks; the whole log used to be read into RAM
+    # and written in one write() on the IOLoop.
+    @gen.coroutine
     def get(self):
-        with open(self.get_ctrl().log.get_path(), 'r') as f:
-            self.write(f.read())
+        with open(self.get_ctrl().log.get_path(), 'rb') as f:
+            while True:
+                chunk = f.read(1024 * 256)
+                if not chunk: break
+                self.write(chunk)
+                yield self.flush()
 
 
     def set_default_headers(self):
@@ -134,32 +157,49 @@ class MessageAckHandler(bbctrl.APIHandler):
 
 
 class BugReportHandler(bbctrl.RequestHandler):
+    # P-09: the tar used to be built in a BytesIO and written whole;
+    # build it in a temp file (it can include the selected program)
+    # and stream it out in chunks.
+    @gen.coroutine
     def get(self):
-        import tarfile, io
+        import tarfile, tempfile
 
-        buf = io.BytesIO()
-        tar = tarfile.open(mode = 'w:bz2', fileobj = buf)
+        tmp = tempfile.NamedTemporaryFile('wb', suffix = '.tar.bz2',
+                                          delete = False)
+        try:
+            tar = tarfile.open(mode = 'w:bz2', fileobj = tmp)
 
-        def check_add(path, arcname = None):
-            if os.path.isfile(path):
-                if arcname is None: arcname = path
-                tar.add(path, self.basename + '/' + arcname)
+            def check_add(path, arcname = None):
+                if os.path.isfile(path):
+                    if arcname is None: arcname = path
+                    tar.add(path, self.basename + '/' + arcname)
 
-        def check_add_basename(path):
-            check_add(path, os.path.basename(path))
+            def check_add_basename(path):
+                check_add(path, os.path.basename(path))
 
-        ctrl = self.get_ctrl()
-        path = ctrl.log.get_path()
-        check_add_basename(path)
-        for i in range(1, 8):
-            check_add_basename('%s.%d' % (path, i))
-        check_add_basename('/var/log/syslog')
-        check_add('config.json')
-        check_add(ctrl.get_upload(ctrl.state.get('selected', '')))
+            ctrl = self.get_ctrl()
+            path = ctrl.log.get_path()
+            check_add_basename(path)
+            for i in range(1, 8):
+                check_add_basename('%s.%d' % (path, i))
+            check_add_basename('/var/log/syslog')
+            check_add('config.json')
+            check_add(ctrl.get_upload(ctrl.state.get('selected', '')))
 
-        tar.close()
+            tar.close()
+            tmp.close()
 
-        self.write(buf.getvalue())
+            with open(tmp.name, 'rb') as f:
+                while True:
+                    chunk = f.read(1024 * 256)
+                    if not chunk: break
+                    self.write(chunk)
+                    yield self.flush()
+        finally:
+            try: tmp.close()
+            except Exception: pass
+            try: os.unlink(tmp.name)
+            except OSError: pass
 
 
     def set_default_headers(self):
@@ -171,6 +211,7 @@ class BugReportHandler(bbctrl.RequestHandler):
 
 
 class HostnameHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def get(self): self.write_json(socket.gethostname())
 
     def put(self):
@@ -211,6 +252,7 @@ class NetworkData(bbctrl.APIHandler):
         })
 
 class NetworkHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
 
     def get(self):
         try:
@@ -270,6 +312,7 @@ class NetworkHandler(bbctrl.APIHandler):
 
 
 class UsernameHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def get(self): self.write_json(get_username())
 
 
@@ -282,6 +325,7 @@ class UsernameHandler(bbctrl.APIHandler):
 
 
 class PasswordHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def put(self):
         if self.get_ctrl().args.demo:
             raise HTTPError(400, 'Cannot set password in demo mode')
@@ -324,98 +368,154 @@ class ConfigDownloadHandler(bbctrl.APIHandler):
         self.set_header('Content-Disposition',
                         'attachment; filename="%s"' % filename)
 
-    def get(self,filename):
-      buffer = io.BytesIO()
-      zip_file = zipfile.ZipFile(buffer, mode="w")
-      config_path = self.get_path('config.json')
+    @gen.coroutine
+    def get(self, filename):
+      # P-16: the no-file-list path used to fall through after finish()
+      # and write into the closed zip a second time, and any listed but
+      # missing program crashed the whole backup.  P-09: the zip is
+      # built in a temp file and streamed, not held whole in RAM.
+      import tempfile
+      tmp = tempfile.NamedTemporaryFile('wb', suffix = '.zip', delete = False)
       try:
-          if os.path.exists(config_path):
-              zip_file.write(config_path,'config.json')
-          else: 
-              json_bytes = json.dumps({'version': self.version}).encode("utf-8")
-              zip_file.writestr("config.json",json_bytes)
+          zip_file = zipfile.ZipFile(tmp, mode = "w")
+          config_path = self.get_path('config.json')
+          try:
+              if os.path.exists(config_path):
+                  zip_file.write(config_path, 'config.json')
+              else:
+                  version = self.get_ctrl().config.version
+                  json_bytes = json.dumps({'version': version}).encode("utf-8")
+                  zip_file.writestr("config.json", json_bytes)
 
-      except Exception: self.log.exception('Internal error: Failed to download config')
-      if not filename or filename == '/':
+          except Exception: self.get_log().exception('Internal error: Failed to download config')
+
+          if filename and filename != '/':
+              files = filename[1:].split(',')
+
+              for name in files:
+                  name = os.path.basename(url_unescape(name))
+                  if not name: continue
+                  filepath = self.get_upload(name)
+                  if not os.path.isfile(filepath):
+                      self.get_log().warning('Config download: skipping missing file %s' % name)
+                      continue
+                  zip_file.write(filepath, name)
+
           zip_file.close()
-          buffer.seek(0)
-          self.write(buffer.getvalue())
+          tmp.close()
+
+          with open(tmp.name, 'rb') as f:
+              while True:
+                  chunk = f.read(1024 * 256)
+                  if not chunk: break
+                  self.write(chunk)
+                  yield self.flush()
           self.finish()
-
-      filename = filename[1:]
-      files = filename.split(',')
-
-      for filename in files:
-          filename = os.path.basename(url_unescape(filename))
-          filepath = self.get_upload(filename)
-          zip_file.write(filepath, filename)
-        
-      zip_file.close()
-      buffer.seek(0)
-
-      self.write(buffer.getvalue())
-      self.finish()
+      finally:
+          try: tmp.close()
+          except Exception: pass
+          try: os.unlink(tmp.name)
+          except OSError: pass
 
 class ConfigRestoreHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
+
+    # P-04: a restored backup is untrusted input.  Limits against zip
+    # bombs, and every member is checked before anything is written.
+    MAX_MEMBERS = 1000
+    MAX_MEMBER_BYTES = 256 * 2 ** 20
+    MAX_TOTAL_BYTES = 512 * 2 ** 20
+
+    def _extract_safely(self, zip_ref, dest):
+        dest = os.path.realpath(dest)
+        total = 0
+        members = zip_ref.infolist()
+        if len(members) > self.MAX_MEMBERS:
+            raise HTTPError(400, 'Backup has too many files')
+        for info in members:
+            if info.is_dir(): continue
+            if info.file_size > self.MAX_MEMBER_BYTES:
+                raise HTTPError(400, 'File in backup is too large: %s' % info.filename)
+            total += info.file_size
+            if total > self.MAX_TOTAL_BYTES:
+                raise HTTPError(400, 'Backup is too large when extracted')
+            # No absolute paths, no '..', no links: resolve the target
+            # and require it to stay inside the extraction directory.
+            if info.external_attr >> 28 == 0o12: # symlink
+                raise HTTPError(400, 'Links are not allowed in a backup')
+            target = os.path.realpath(os.path.join(dest, info.filename))
+            if target != dest and not target.startswith(dest + os.sep):
+                raise HTTPError(400, 'Unsafe path in backup: %s' % info.filename)
+            os.makedirs(os.path.dirname(target), exist_ok = True)
+            with zip_ref.open(info) as src, open(target, 'wb') as out:
+                shutil.copyfileobj(src, out, 1024 * 256)
+
+
     def put(self):
         if 'zipfile' not in self.request.files:
             raise HTTPError(400, 'No file uploaded')
-        
+
         zip_file = self.request.files['zipfile'][0]
-        temp_dir = './config-temp'
+        # P-04: never let the uploader name the on-disk file.
+        upload_name = os.path.basename(zip_file['filename'] or 'backup.zip')
 
-        if not os.path.exists(temp_dir):
-            os.mkdir(temp_dir)
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix = 'config-restore-')
+        try:
+            files_path = os.path.join(temp_dir, upload_name)
 
-        files_path = os.path.join(temp_dir, zip_file['filename'])
+            with open(files_path, 'wb') as f:
+                f.write(zip_file['body'])
 
-        with open(files_path, 'wb') as f:
-            f.write(zip_file['body'])
+            if not os.path.exists(self.get_upload()):
+                os.mkdir(self.get_upload())
 
-        if not os.path.exists(self.get_upload()):
-            os.mkdir(self.get_upload())
+            extract_dir = os.path.join(temp_dir, 'extracted')
+            os.mkdir(extract_dir)
+            try:
+                with zipfile.ZipFile(files_path, 'r') as zip_ref:
+                    self._extract_safely(zip_ref, extract_dir)
+            except zipfile.BadZipFile:
+                raise HTTPError(400, 'Uploaded file is not a zip backup')
 
+            extension = (".nc", ".ngc", ".gcode", ".gc")
 
-        with zipfile.ZipFile(files_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir+'/extracted')
+            for root, dirs, files in os.walk(extract_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
 
-        extension = (".nc", ".ngc", ".gcode", ".gc")
+                    #Updating the config.json
+                    if file =="config.json":
+                        with open(file_path, 'r') as json_file:
+                            json_data = json.load(json_file)
 
-        for root, dirs, files in os.walk(temp_dir+'/extracted'):
-            for file in files:
-                file_path = os.path.join(root, file)
+                            if "macros" in json_data and isinstance(json_data['macros'], list):
+                                json_data["macros_list"] = [
+                                    {"file_name": item["file_name"]}
+                                    for item in json_data["macros"]
+                                    if isinstance(item, dict) and "file_name" in item and item["file_name"] != "default"
+                                ]
+                            else:
+                                json_data["macros_list"] = []
 
-                #Updating the config.json
-                if file =="config.json":
-                    with open(file_path, 'r') as json_file:
-                        json_data = json.load(json_file)
+                            keys_to_remove = ['non_macros_list','gcode_list']
+                            for key in keys_to_remove:
+                                if key in json_data:
+                                    del json_data[key]
+                            self.get_ctrl().config.save(json_data)
 
-                        if "macros" in json_data and isinstance(json_data['macros'], list):
-                            json_data["macros_list"] = [
-                                {"file_name": item["file_name"]}
-                                for item in json_data["macros"]
-                                if isinstance(item, dict) and "file_name" in item and item["file_name"] != "default"
-                            ]
-                        else:
-                            json_data["macros_list"] = []
-
-                        keys_to_remove = ['non_macros_list','gcode_list']
-                        for key in keys_to_remove:
-                            if key in json_data:
-                                del json_data[key]
-                        self.get_ctrl().config.save(json_data)
-
-                #moving the gcodes from temp to uploads
-                elif file.endswith(extension):
-                    filename = self.get_upload(file).encode('utf8')
-                    try:
-                        os.link(file_path,filename)
-                    except FileExistsError as e:
-                        print('File already exists')
-                    self.get_ctrl().preplanner.invalidate(file)
-                    self.get_ctrl().state.add_file(file)
-
-        shutil.rmtree(temp_dir)
+                    #moving the gcodes from temp to uploads
+                    elif file.endswith(extension):
+                        filename = self.get_upload(file).encode('utf8')
+                        try:
+                            os.link(file_path,filename)
+                        except FileExistsError as e:
+                            print('File already exists')
+                        self.get_ctrl().preplanner.invalidate(file)
+                        self.get_ctrl().state.add_file(file)
+        finally:
+            # P-04: the temp dir goes away on every path, not just success.
+            shutil.rmtree(temp_dir, ignore_errors = True)
 
 
 class ConfigSaveHandler(bbctrl.APIHandler):
@@ -427,11 +527,57 @@ class ConfigSaveHandler(bbctrl.APIHandler):
 
 
 class ConfigResetHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def put_ok(self): self.get_ctrl().config.reset()
 
 
 class FirmwareUpdateHandler(bbctrl.APIHandler):
-    def prepare(self): pass
+    ADMIN_ONLY = True # P-01
+
+    def prepare(self):
+        # Not APIHandler.prepare: the body is a multipart file upload,
+        # not JSON.  Run only the base admin gate (P-01).
+        bbctrl.RequestHandler.prepare(self)
+
+
+    # P-03: an uploaded package is executed as root by the updater
+    # (scripts/install.sh inside it), so validate it as far as Python can
+    # before handing it over: admin-gated (above), size-capped, a real
+    # bzip2 tar, no member that could escape the extraction directory
+    # (absolute paths, '..', links pointing outside, device nodes), and
+    # it must actually contain an installer.  Cryptographic signature
+    # verification still requires a release signing key pinned in the
+    # firmware, which does not exist yet; until it does, the SHA-256 of
+    # every accepted package is logged so an install can be audited.
+    MAX_BYTES = 256 * 2 ** 20
+
+    def _validate_package(self, body):
+        import hashlib, tarfile
+        if len(body) > self.MAX_BYTES:
+            raise HTTPError(413, 'Firmware package too large')
+        if body[:3] != b'BZh' or body[3:4] not in b'123456789':
+            raise HTTPError(400, 'Firmware package is not a bzip2 archive')
+        try:
+            tar = tarfile.open(fileobj = io.BytesIO(body), mode = 'r:bz2')
+            members = tar.getmembers()
+        except Exception:
+            raise HTTPError(400, 'Firmware package is not a readable tar archive')
+        if not members: raise HTTPError(400, 'Firmware package is empty')
+        have_installer = False
+        for m in members:
+            parts = m.name.replace('\\', '/').split('/')
+            if m.name.startswith('/') or '..' in parts:
+                raise HTTPError(400, 'Unsafe path in firmware package: %s' % m.name)
+            if m.issym() or m.islnk():
+                link = m.linkname.replace('\\', '/')
+                if link.startswith('/') or '..' in link.split('/'):
+                    raise HTTPError(400, 'Unsafe link in firmware package: %s' % m.name)
+            if m.isdev() or m.isfifo():
+                raise HTTPError(400, 'Device entry in firmware package: %s' % m.name)
+            if m.name.endswith('scripts/install.sh'): have_installer = True
+        if not have_installer:
+            raise HTTPError(400, 'Firmware package has no scripts/install.sh')
+        return hashlib.sha256(body).hexdigest()
 
 
     def put_ok(self):
@@ -439,6 +585,8 @@ class FirmwareUpdateHandler(bbctrl.APIHandler):
             raise HTTPError(401, 'Missing "firmware"')
 
         firmware = self.request.files['firmware'][0]
+        sha = self._validate_package(firmware['body'])
+        self.get_log('Firmware').info('Accepting firmware package sha256=%s' % sha)
 
         if not os.path.exists('firmware'): os.mkdir('firmware')
 
@@ -450,6 +598,7 @@ class FirmwareUpdateHandler(bbctrl.APIHandler):
 
 
 class UpgradeHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
     def put_ok(self):
         self.get_ctrl().lcd.goodbye('Upgrading firmware')
         subprocess.Popen(['/usr/local/bin/upgrade-bbctrl'])
@@ -508,7 +657,8 @@ class HomeHandler(bbctrl.APIHandler):
             if not 'position' in self.json:
                 raise HTTPError(400, 'Missing "position"')
 
-            self.get_ctrl().mach.home(axis, self.json['position'])
+            pos = finite_float(self.json['position'], 'position', -1e6, 1e6)
+            self.get_ctrl().mach.home(axis, pos)
 
         elif action == '/clear': self.get_ctrl().mach.unhome(axis)
         else: self.get_ctrl().mach.home(axis)
@@ -649,20 +799,26 @@ class OptionalPauseHandler(bbctrl.APIHandler):
 
 
 class StepHandler(bbctrl.APIHandler):
-    def put_ok(self): self.get_ctrl().mach.step()
+    # P-22: Mach.step was never implemented — calling it raised a bare
+    # Exception('NYI') (a 500).  Answer honestly with 501 instead.
+    def put_ok(self):
+        raise HTTPError(501, 'Step is not implemented')
 
 
 class PositionHandler(bbctrl.APIHandler):
     def put_ok(self, axis):
-        self.get_ctrl().mach.set_position(axis, float(self.json['position']), True)
+        pos = finite_float(self.json.get('position'), 'position', -1e6, 1e6)
+        self.get_ctrl().mach.set_position(axis, pos, True)
 
 
 class OverrideFeedHandler(bbctrl.APIHandler):
-    def put_ok(self, value): self.get_ctrl().mach.override_feed(float(value))
+    def put_ok(self, value):
+        self.get_ctrl().mach.override_feed(finite_float(value, 'feed override', 0, 2))
 
 
 class OverrideSpeedHandler(bbctrl.APIHandler):
-    def put_ok(self, value): self.get_ctrl().mach.override_speed(float(value))
+    def put_ok(self, value):
+        self.get_ctrl().mach.override_speed(finite_float(value, 'speed override', 0, 2))
 
 
 class ModbusReadHandler(bbctrl.APIHandler):
@@ -747,6 +903,7 @@ class ResumeHandler(bbctrl.APIHandler):
     # build: write a program that continues the interrupted job
     # park:  stop the job, turn the spindle off and lift Z so the machine
     #        can be powered off, to be resumed later
+    @gen.coroutine
     def put(self):
         ctrl = self.get_ctrl()
         res = getattr(ctrl, 'resume', None)
@@ -755,7 +912,8 @@ class ResumeHandler(bbctrl.APIHandler):
 
         try:
             if action == 'build':
-                self.write_json(res.build(self.json.get('opts') or {}))
+                # P-08: build runs in the worker process (build_async)
+                self.write_json((yield res.build_async(self.json.get('opts') or {})))
             elif action == 'park':
                 res.park()
                 self.write_json('ok')
@@ -809,19 +967,34 @@ class CameraFrameHandler(bbctrl.RequestHandler):
 
 class AlignHandler(bbctrl.APIHandler):
     # Write a copy of a program rotated about its X0 Y0 (camera alignment).
+    @gen.coroutine
     def put(self):
         al = getattr(self.get_ctrl(), 'align', None)
         if al is None: raise HTTPError(503, 'Alignment is not available')
         j = self.json if isinstance(self.json, dict) else {}
-        try: self.write_json(al.build(j.get('file'), j.get('angle')))
+        try:
+            # P-08: build runs in the worker process (build_async)
+            self.write_json((yield al.build_async(j.get('file'), j.get('angle'))))
         except bbctrl.AlignError as e: raise HTTPError(400, '%s', str(e))
 
 
 class JogHandler(bbctrl.APIHandler):
     def put_ok(self):
+        # P-15: reject malformed jog payloads cleanly (400) before any
+        # machine state changes; keep only axis keys, finite, clamped.
+        if not isinstance(self.json, dict):
+            raise HTTPError(400, 'Bad jog command')
+        axes = {}
+        for a in 'xyzabc':
+            if a in self.json:
+                v = finite_float(self.json[a], 'jog ' + a)
+                axes[a] = max(-1.0, min(1.0, v))
+
         # Handle possible out of order jog command processing
         if 'ts' in self.json:
-            ts = self.json['ts']
+            try: ts = float(self.json['ts'])
+            except (TypeError, ValueError):
+                raise HTTPError(400, 'Bad jog timestamp')
             id = self.get_cookie('client-id')
 
             if not hasattr(self.app, 'last_jog'):
@@ -833,7 +1006,7 @@ class JogHandler(bbctrl.APIHandler):
             if ts < last: return # Out of order
 
         ctrl = self.get_ctrl()
-        ctrl.mach.jog(self.json)
+        ctrl.mach.jog(axes)
 
         # Optional dead-man watchdog.  A client that sends "keepalive" must
         # keep re-sending its jog command.  If the updates stop (browser
@@ -845,7 +1018,7 @@ class JogHandler(bbctrl.APIHandler):
             ioloop.remove_timeout(timer)
             self.app.jog_watchdog = None
 
-        moving = any(self.json.get(a, 0) for a in 'xyzabc')
+        moving = any(axes.get(a, 0) for a in 'xyzabc')
         if self.json.get('keepalive') and moving:
             def stop():
                 self.app.jog_watchdog = None
@@ -862,6 +1035,7 @@ transformationMatrixPattern = re.compile(
 matchIsTouchscreenPattern = re.compile(
     r'(\n)(\s+)(MatchIsTouchscreen.*?\n)(.*?EndSection)', re.DOTALL)
 class ScreenRotationHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
 
     @gen.coroutine
     def get(self):
@@ -903,6 +1077,7 @@ class ScreenRotationHandler(bbctrl.APIHandler):
 
 
 class TimeHandler(bbctrl.APIHandler):
+    ADMIN_ONLY = True # P-01
 
     def get(self):
         timeinfo = call_get_output(['timedatectl'])
@@ -1092,37 +1267,12 @@ class RotaryHandler(bbctrl.APIHandler):
             log.error('Unexpected error: {}'.format(e))
 
 
-class RemoteDiagnosticsHandler(bbctrl.APIHandler):
-
-    def get(self):
-        code = self.get_query_argument("code", "")
-        command = self.get_query_argument("command", "")
-
-        log = self.get_log('RemoteDiagnostics')
-
-        if command == "disconnect":
-            subprocess.Popen(['killall', 'ngrok'])
-            self.write_json({'message': "Succesfully disconnected"})
-
-        if command == "connect":
-            try:
-                url = 'https://tinyurl.com/1f-remote?code={}'.format(code)
-                with urlopen(url) as response:
-                    body = response.read()
-
-                    os.makedirs("/tmp/ngrok", exist_ok=True)
-                    with open("/tmp/ngrok/1f-ngrok.sh", 'wb') as f:
-                        f.write(body)
-
-                subprocess.Popen(['/bin/bash', "/tmp/ngrok/1f-ngrok.sh"])
-                self.write_json({'success': True})
-            except Exception as e:
-                log.info("Failed: {}".format(str(e)))
-                self.write_json({
-                    'success': False,
-                    'code': e.code or None,
-                    'message': e.reason or "Unknown"
-                })
+# P-02: the former RemoteDiagnosticsHandler was removed.  It downloaded a
+# shell script from a short-URL redirect (tinyurl.com/1f-remote) on an
+# unauthenticated GET and executed it as root to open an ngrok tunnel.
+# Download-and-execute of remotely fetched, unsigned code has no safe form
+# here; remote support access must be set up on the device itself, out of
+# band, never by fetching a script at request time.
 
 # Base class for Web Socket connections
 class ClientConnection(object):
@@ -1273,8 +1423,8 @@ class Web(tornado.web.Application):
             (r'/api/pause/optional', OptionalPauseHandler),
             (r'/api/step', StepHandler),
             (r'/api/position/([xyzabcXYZABC])', PositionHandler),
-            (r'/api/override/feed/([\d.]+)', OverrideFeedHandler),
-            (r'/api/override/speed/([\d.]+)', OverrideSpeedHandler),
+            (r'/api/override/feed/(\d+(?:\.\d+)?)', OverrideFeedHandler),
+            (r'/api/override/speed/(\d+(?:\.\d+)?)', OverrideSpeedHandler),
             (r'/api/modbus/read', ModbusReadHandler),
             (r'/api/modbus/write', ModbusWriteHandler),
             (r'/api/jog', JogHandler),
@@ -1282,7 +1432,6 @@ class Web(tornado.web.Application):
             (r'/api/screen-rotation', ScreenRotationHandler),
             (r'/api/time', TimeHandler),
             (r'/api/rotary', RotaryHandler),
-            (r'/api/remote-diagnostics', RemoteDiagnosticsHandler),
             # The React interface is the interface. Old /next/ bookmarks go to /.
             (r'/next', tornado.web.RedirectHandler, {'url': '/'}),
             (r'/next/(.*)', tornado.web.RedirectHandler, {'url': '/'}),

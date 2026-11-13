@@ -159,7 +159,7 @@ def parse_args():
                         help = 'Camera height')
     parser.add_argument('--fps', default = 15, type = int,
                         help = 'Camera frames per second')
-    parser.add_argument('--camera-clients', default = 4,
+    parser.add_argument('--camera-clients', default = 4, type = int,
                         help = 'Maximum simultaneous camera clients')
     parser.add_argument('--demo', action = 'store_true',
                         help = 'Enter demo mode')

@@ -310,10 +310,18 @@
             executeCenterSecondProbe();
         }
 
-        await Promise.race([
+        const racers = [
             ...writables.map((writable) => waitForChange(writable)),
             waitForChange(cancelled),
-        ]);
+        ];
+
+        try {
+            await Promise.race(racers);
+        } finally {
+            // The losing waiters never resolve; without this their store
+            // subscriptions leak for the rest of the session.
+            racers.forEach((racer) => racer.cancel());
+        }
 
         if ($cancelled) {
             throw new Error("cancelled");

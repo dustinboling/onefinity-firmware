@@ -1,12 +1,74 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 
+// P-01: the server gates the destructive / admin endpoints behind the
+// controller's OS password (X-Admin-Password header, loopback exempt).
+// From another browser on the LAN those calls come back 401, so on a
+// 401 from a gated call we ask the operator for the password once,
+// keep it for this browser session only (sessionStorage — never
+// localStorage, never a cookie) and retry the call once.  A password
+// that still gets a 401 is forgotten again, so a wrong entry surfaces
+// as the call's normal error instead of prompting in a loop.  The
+// header is attached only to gated calls, so normal machine operation
+// (jog, home, run, e-stop) never carries or prompts for it.
+const ADMIN_PASSWORD_KEY = "bbctrl-admin-password";
+const ADMIN_PATHS = new Set([
+  "reboot", "shutdown", "hostname", "network", "remote/username",
+  "remote/password", "config/restore", "config/reset",
+  "firmware/update", "upgrade", "screen-rotation", "time",
+]);
+
+function isAdminCall(method, url) {
+  if (method === "GET") return false;
+  const path = url.split("?")[0].replace(/^\//, "");
+  // FileHandler gates only DELETE; uploads and downloads stay open.
+  if (path === "file" || path.startsWith("file/")) return method === "DELETE";
+  return ADMIN_PATHS.has(path);
+}
+
+function storedAdminPassword() {
+  try { return sessionStorage.getItem(ADMIN_PASSWORD_KEY) || ""; } catch { return ""; }
+}
+
+function clearAdminPassword() {
+  try { sessionStorage.removeItem(ADMIN_PASSWORD_KEY); } catch { /* no storage */ }
+}
+
+function askAdminPassword() {
+  const password = window.prompt(
+    "This action needs the controller password. Enter it to continue:");
+  if (password) {
+    try { sessionStorage.setItem(ADMIN_PASSWORD_KEY, password); } catch { /* no storage */ }
+  }
+  return password || "";
+}
+
+async function fetchApi(method, url, opts, retried = false, password = "") {
+  const headers = { ...(opts.headers || {}) };
+  if (isAdminCall(method, url)) {
+    const adminPassword = password || storedAdminPassword();
+    if (adminPassword) headers["X-Admin-Password"] = adminPassword;
+  }
+  const r = await fetch(`/api/${url}`, { ...opts, method, headers });
+  if (r.status === 401 && isAdminCall(method, url)) {
+    clearAdminPassword();
+    const entered = retried ? "" : askAdminPassword();
+    if (entered) return fetchApi(method, url, opts, true, entered);
+  }
+  return r;
+}
+
+// Raw variant for callers that need the Response itself (they check
+// r.ok and read the body their own way), e.g. config restore.
+export const apiFetch = (url, opts = {}) =>
+  fetchApi((opts.method || "GET").toUpperCase(), url, opts);
+
 async function call(method, url, body) {
-  const opts = { method, cache: "no-cache", headers: {} };
+  const opts = { cache: "no-cache", headers: {} };
   if (body !== undefined) {
     if (body instanceof Blob || body instanceof FormData) opts.body = body;
     else { opts.headers["Content-Type"] = "application/json; charset=utf-8"; opts.body = JSON.stringify(body); }
   }
-  const r = await fetch(`/api/${url}`, opts);
+  const r = await fetchApi(method, url, opts);
   if (!r.ok) throw new Error(await r.text());
   const text = await r.text();
   try { return JSON.parse(text); } catch { return text; }
@@ -20,19 +82,32 @@ export const api = {
 export const MACRO_PREFIX = "EgZjaHJvbWUqCggBEAAYsQMYgAQyBggAEEUYOTIKCAE";
 export const DELETE_LIST_PREFIX = "DINCAIQABiDARixAxiABDIHCAMQABiABDIHCAQQABiABDIH";
 
-export async function loadPath(file) {
-  // The planner answers {progress} until the path is ready.
+const abortError = () => { const e = new Error("Aborted"); e.name = "AbortError"; return e; };
+const waitOrAbort = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal && signal.aborted) { reject(abortError()); return; }
+  const t = setTimeout(resolve, ms);
+  if (signal) signal.addEventListener("abort", () => { clearTimeout(t); reject(abortError()); }, { once: true });
+});
+
+// Polls the planner until the path is ready. Bounded (3 minutes) and cancellable through
+// the caller's AbortSignal: a wedged plan used to leave a poller running against the
+// controller for the life of the page on every file selection, with the tabs stuck on
+// "Planning the tool path…" and no failure ever shown.
+export async function loadPath(file, signal) {
+  const deadline = Date.now() + 3 * 60 * 1000;
   for (;;) {
+    if (signal && signal.aborted) throw abortError();
     const info = await api.get(`path/${encodeURIComponent(file)}`);
     if (info.progress === undefined || info.progress === 1) {
       const [p, s] = await Promise.all(
         ["positions", "speeds"].map((k) =>
-          fetch(`/api/path/${encodeURIComponent(file)}/${k}`).then((r) => r.arrayBuffer())
+          fetch(`/api/path/${encodeURIComponent(file)}/${k}`, { signal }).then((r) => r.arrayBuffer())
         )
       );
       return { bounds: info.bounds, time: info.time, lines: info.lines, positions: new Float32Array(p), speeds: new Float32Array(s) };
     }
-    await new Promise((r) => setTimeout(r, 500));
+    if (Date.now() > deadline) throw new Error("The controller took too long to plan this program.");
+    await waitOrAbort(500, signal);
   }
 }
 
@@ -204,13 +279,27 @@ export function useConfig(state) {
 
   // Change only the program lists (folders, files) in the saved settings. Unsaved edits to other settings,
   // on this screen or another, are not saved by it and stay unsaved.
+  // The server offers no compare-and-set for the config, so this narrows the read-modify-write
+  // window instead: the lists are re-read immediately before the save, and if another screen
+  // changed them in the meantime the mutation is re-applied to that fresh copy and retried —
+  // never blindly saved over the top (which used to resurrect files another screen had deleted,
+  // or drop folders it had just created). If the lists keep changing, it gives up loudly.
   const saveLists = useCallback(async (fn) => {
-    const c = await api.get("config/load");
-    fn(c);
-    await api.put("config/save", c);
-    const fresh = await api.get("config/load");
-    fresh.full_version = fixVersion(fresh.full_version);
-    setDraft((d) => (!d || !modRef.current ? fresh : { ...d, gcode_list: fresh.gcode_list, non_macros_list: fresh.non_macros_list, macros_list: fresh.macros_list }));
+    const LIST_KEYS = ["gcode_list", "non_macros_list", "macros_list"];
+    const snap = (c) => JSON.stringify(LIST_KEYS.map((k) => c[k] || null));
+    let base = await api.get("config/load");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const c = clone(base);
+      fn(c);
+      const fresh = await api.get("config/load");
+      if (snap(fresh) !== snap(base)) { base = fresh; continue; }
+      await api.put("config/save", c);
+      const after = await api.get("config/load");
+      after.full_version = fixVersion(after.full_version);
+      setDraft((d) => (!d || !modRef.current ? after : { ...d, gcode_list: after.gcode_list, non_macros_list: after.non_macros_list, macros_list: after.macros_list }));
+      return;
+    }
+    throw new Error("The program lists changed on another screen each time this tried to save. Nothing was overwritten — try again.");
   }, []);
   const discard = useCallback(() => { clearTimeout(shareTimer.current); uiClose("cfg-draft"); return reload(true); }, [reload]);
   return { config: draft, template, net, modified, edit, patch, save, saveLists, reload, discard };

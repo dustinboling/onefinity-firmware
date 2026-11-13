@@ -82,7 +82,17 @@ export default function Job({ state, mach, path, metric, config, changes = [] })
   }, []);
   useEffect(() => {
     if (!live.length) return undefined;
-    const t = setInterval(() => setProbeTick((n) => n + 1), 3000);
+    // Re-check while a warning shows, but not forever and not on a page nobody can see:
+    // ticks are skipped while the document is hidden (the checkpoint.js pattern), and the
+    // 3 s cadence stops after ~2 minutes — after that the checks re-run on probe/prefs
+    // changes, which are already dependencies of the checks effect.
+    let repeats = 0;
+    const t = setInterval(() => {
+      if (document.hidden) return;
+      repeats += 1;
+      if (repeats > 40) { clearInterval(t); return; }
+      setProbeTick((n) => n + 1);
+    }, 3000);
     return () => clearInterval(t);
   }, [live.length]);
   useEffect(() => {

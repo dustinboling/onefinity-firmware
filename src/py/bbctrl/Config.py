@@ -27,6 +27,7 @@
 
 import os
 import json
+import threading
 import pkg_resources
 from pkg_resources import Requirement, resource_filename
 
@@ -50,6 +51,11 @@ class Config(object):
         self.log = ctrl.log.get('Config')
 
         self.values = {}
+        # P-06: one lock serialises every read-modify-write of
+        # config.json, and _loaded caches the last loaded/saved config
+        # so set() mutates memory instead of re-reading the file.
+        self._lock = threading.RLock()
+        self._loaded = None
 
         try:
             self.version = "1.38.0"
@@ -78,6 +84,7 @@ class Config(object):
             config = {'version': self.version}
 
         self._defaults(config)
+        self._loaded = config
         return config
 
 
@@ -92,10 +99,20 @@ class Config(object):
         path = self.ctrl.get_path('config.json')
 
         try:
-            if os.path.exists(path):
-                with open(path, 'r') as f: config_data = json.load(f)
-            else: config_data = {'version': self.version}
+            with self._lock:
+                # P-06: mutate the in-memory config under the lock; the
+                # old code re-read the file unlocked, so two set() calls
+                # could interleave and drop each other's change.
+                if self._loaded is not None: config_data = self._loaded
+                elif os.path.exists(path):
+                    with open(path, 'r') as f: config_data = json.load(f)
+                else: config_data = {'version': self.version}
 
+                self._set_locked(config_data, name, default)
+        except Exception: self.log.exception('Internal error: Failed to upgrade config')
+
+
+    def _set_locked(self, config_data, name, default):
             if name in config_data:
                 existing_value = config_data[name]
                 if isinstance(existing_value, dict) and isinstance(default, dict):
@@ -109,12 +126,24 @@ class Config(object):
                     config_data[name] = default
             else:
                 config_data[name] = default
-            
+
             self.save(config_data)
-        except Exception: self.log.exception('Internal error: Failed to upgrade config')
 
     def save(self, config):
-        self._upgrade(config)
+        with self._lock:
+            self._save_locked(config)
+
+
+    def _save_locked(self, config):
+        # P-17: save() used to call _upgrade unwrapped, so a config
+        # without a usable 'version' (hand-edited, older, restored)
+        # crashed the save with KeyError.  _upgrade now tolerates it.
+        try:
+            self._upgrade(config)
+        except Exception:
+            self.log.exception('Internal error: Failed to upgrade config')
+            config['version'] = self.version.split('b')[0]
+            config['full_version'] = self.version
         self._update(config, False)
 
         path = self.ctrl.get_path('config.json')
@@ -122,10 +151,24 @@ class Config(object):
             with open(path, 'r') as f: old = json.load(f)
         except Exception: old = None
 
-        with open(path, 'w') as f:
+        # P-06: write atomically — tmp file, fsync, os.replace, fsync
+        # the directory (the NextStoreHandler/Work.FileCache pattern).
+        # The old in-place truncate-and-dump left a torn config.json
+        # behind whenever power went mid-write, silently reverting the
+        # machine to template defaults on the next boot.
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump(config, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            dfd = os.open(os.path.dirname(path) or '.', os.O_RDONLY)
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+        except OSError: pass
 
-        os.sync()
+        self._loaded = config
 
         # The Files tab saves its folder lists right after every upload. Those
         # lists don't change any plan, so keep the plans (1.31.3): dropping
@@ -136,39 +179,61 @@ class Config(object):
 
 
     def reset(self):
-        if os.path.exists('config.json'): os.unlink('config.json')
-        self.reload()
-        self.ctrl.preplanner.invalidate_all()
+        with self._lock:
+            if os.path.exists('config.json'): os.unlink('config.json')
+            self._loaded = None
+            self.reload()
+            self.ctrl.preplanner.invalidate_all()
 
 
-    def _valid_value(self, template, value):
+    def _convert_value(self, template, value):
+        '''P-17: return (True, converted value) or (False, None).  The
+        old _valid_value converted only a local copy, so the stored
+        value kept its original type — a string 'false' stayed truthy,
+        and a string number later crashed the min/max comparison with
+        int < str.'''
         type = template['type']
 
         try:
             if type == 'int':   value = int(value)
             if type == 'float': value = float(value)
             if type == 'text':  value = str(value)
-            if type == 'bool':  value = bool(value)
-        except:
-            return False
+            if type == 'bool':
+                if isinstance(value, str):
+                    value = value.strip().lower() in ('true', '1', 'yes', 'on')
+                else: value = bool(value)
+        except Exception:
+            return False, None
 
         if 'values' in template and value not in template['values']:
-            return False
+            return False, None
 
-        return True
+        return True, value
+
+
+    def _valid_value(self, template, value):
+        return self._convert_value(template, value)[0]
 
 
     def __defaults(self, config, name, template):
         if 'type' in template:
-            if (not name in config or
-                not self._valid_value(template, config[name])):
+            ok, converted = (False, None)
+            if name in config:
+                ok, converted = self._convert_value(template, config[name])
+
+            if not ok:
                 config[name] = template['default']
 
-            elif 'max' in template and template['max'] < config[name]:
-                config[name] = template['max']
+            else:
+                # Store the converted value, then clamp it (both are
+                # now the template's type, so the comparison is safe).
+                config[name] = converted
 
-            elif 'min' in template and config[name] < template['min']:
-                config[name] = template['min']
+                if 'max' in template and template['max'] < config[name]:
+                    config[name] = template['max']
+
+                elif 'min' in template and config[name] < template['min']:
+                    config[name] = template['min']
 
             if template['type'] == 'list':
                 if 'index' in template:
@@ -196,10 +261,20 @@ class Config(object):
 
 
     def _upgrade(self, config):
-        version = config['version']
-        version = version.split('b')[0] # Strip off any "beta" suffix
-        version = version.split('-')[0]
-        version = tuple(map(int, version.split('.'))) # Break it into a tuple of integers
+        # P-17: a missing or unparsable version means "treat as
+        # current", not KeyError/ValueError out of save()/load().
+        raw = config.get('version') or self.version
+        try:
+            version = str(raw).split('b')[0] # Strip off any "beta" suffix
+            version = version.split('-')[0]
+            version = tuple(map(int, version.split('.'))) # Break it into a tuple of integers
+        except Exception:
+            version = tuple(map(int, self.version.split('.')))
+
+        # The old-version blocks below index these blindly.
+        for key in ('settings', 'probe'):
+            if not isinstance(config.get(key), dict): config[key] = {}
+        if not isinstance(config.get('motors'), list): config['motors'] = []
 
         if version < (1, 0, 7):
             config['settings']['max-deviation'] = 0.001

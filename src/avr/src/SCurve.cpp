@@ -106,7 +106,19 @@ float SCurve::stoppingDist(float v, float a, float maxA, float maxJ) {
   }
 
   // Compute max deccel
-  float maxDeccel = -sqrt(v * maxJ + 0.5 * a * a);
+  // AVR-23: memoise the sqrt: it is a pure function of (v, a, maxJ),
+  // and during a constant-velocity jog cruise those are identical
+  // segment after segment.  Exact float key match, so results are
+  // bit-identical; the cache only skips recomputation.
+  static float cache_v = 0, cache_a = 0, cache_maxJ = 0, cache_sqrt = 0;
+  float radicand = v * maxJ + 0.5 * a * a;
+  float root;
+  if (cache_maxJ == maxJ && cache_v == v && cache_a == a) root = cache_sqrt;
+  else {
+    root = sqrt(radicand);
+    cache_v = v; cache_a = a; cache_maxJ = maxJ; cache_sqrt = root;
+  }
+  float maxDeccel = -root;
   if (maxDeccel < -maxA) maxDeccel = -maxA;
 
   // Compute distance and velocity change to max deccel
@@ -146,7 +158,16 @@ float SCurve::nextAccel(float t, float targetV, float v, float a, float maxA,
     return a - deltaA; // positive accel, decreasing speed
 
   float deltaV = fabs(targetV - v);
-  float targetA = sqrt(2 * deltaV * maxJ);
+  // AVR-23: memoise the sqrt, as in stoppingDist() above: a pure
+  // function of (deltaV, maxJ), repeatedly evaluated with the same
+  // values during constant-velocity segments in the LO interrupt path.
+  static float cache_dv = -1, cache_maxJ = 0, cache_sqrt = 0;
+  float targetA;
+  if (cache_maxJ == maxJ && cache_dv == deltaV) targetA = cache_sqrt;
+  else {
+    targetA = sqrt(2 * deltaV * maxJ);
+    cache_dv = deltaV; cache_maxJ = maxJ; cache_sqrt = targetA;
+  }
   if (maxA < targetA) targetA = maxA;
 
   if (increasing) {

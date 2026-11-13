@@ -62,35 +62,59 @@ const char *status_level_pgmstr(status_level_t level) {
 
 stat_t status_message_P(const char *location, status_level_t level,
                         stat_t code, const char *msg, ...) {
+  // AVR-24: this used to print via printf/putchar, i.e. via the
+  // blocking usart_putc().  Status messages are also raised from
+  // interrupt-adjacent contexts (e.g. seek_end() from the LO exec
+  // interrupt), where spinning on a full TX ring stalls the caller for
+  // as long as the ring takes to drain -- or worse.  Format the whole
+  // line into a bounded buffer, truncating if necessary, and emit it
+  // with the non-blocking usart_try_putc(): if the ring fills, the
+  // remainder of this message is dropped instead of blocking.
+  char buf[192];
+  unsigned len = 0;
   va_list args;
 
-  // Type
-  printf_P(PSTR("\n{\"level\":\"%" PRPSTR "\",\"msg\":\""),
-           status_level_pgmstr(level));
+#define STATUS_APPEND(...)                                              \
+  do {                                                                  \
+    if (len < sizeof(buf)) {                                            \
+      int n = snprintf_P(buf + len, sizeof(buf) - len, __VA_ARGS__);    \
+      if (0 < n) len += (unsigned)n;                                    \
+    }                                                                   \
+  } while (0)
 
-  // Message
-  printf_P(PSTR("%" PRPSTR), status_to_pgmstr(code));
+  // Type and message text
+  STATUS_APPEND(PSTR("\n{\"level\":\"%" PRPSTR "\",\"msg\":\"%" PRPSTR),
+                status_level_pgmstr(level), status_to_pgmstr(code));
 
   if (msg && pgm_read_byte(msg)) {
-    putchar(':');
-    putchar(' ');
+    STATUS_APPEND(PSTR(": "));
 
     // TODO escape invalid chars
-    va_start(args, msg);
-    vfprintf_P(stdout, msg, args);
-    va_end(args);
+    if (len < sizeof(buf)) {
+      va_start(args, msg);
+      int n = vsnprintf_P(buf + len, sizeof(buf) - len, msg, args);
+      va_end(args);
+      if (0 < n) len += (unsigned)n;
+    }
   }
 
-  putchar('"');
+  STATUS_APPEND(PSTR("\""));
 
   // Code
-  if (code) printf_P(PSTR(",\"code\":%d"), code);
+  if (code) STATUS_APPEND(PSTR(",\"code\":%d"), code);
 
   // Location
-  if (location) printf_P(PSTR(",\"where\":\"%" PRPSTR "\""), location);
+  if (location)
+    STATUS_APPEND(PSTR(",\"where\":\"%" PRPSTR "\"}"), location);
+  else STATUS_APPEND(PSTR("}"));
 
-  putchar('}');
-  putchar('\n');
+  STATUS_APPEND(PSTR("\n"));
+
+#undef STATUS_APPEND
+
+  // Emit, dropping the rest of the line if the TX ring fills
+  for (const char *p = buf; *p; p++)
+    if (!usart_try_putc(*p)) break;
 
   return code;
 }

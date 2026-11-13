@@ -54,6 +54,31 @@ typedef struct {
 static seek_t seek = {false, SW_INVALID, 0};
 
 
+// AVR-3: motor currently switched to stall microsteps, or -1.  Recorded
+// when the seek executes so seek_end()/seek_cancel() can restore exactly
+// that one motor.
+static int stall_motor = -1;
+
+
+static int _stall_motor_for_switch(switch_id_t sw) {
+  switch (sw) {
+  case SW_STALL_0: return 0;
+  case SW_STALL_1: return 1;
+  case SW_STALL_2: return 2;
+  case SW_STALL_3: return 3;
+  default: return -1;
+  }
+}
+
+
+static void _restore_stall_microstep() {
+  if (0 <= stall_motor) {
+    disable_stall_microstep(stall_motor);
+    stall_motor = -1;
+  }
+}
+
+
 switch_id_t seek_get_switch() {return seek.active ? seek.sw : SW_INVALID;}
 
 bool seek_active() {
@@ -75,30 +100,21 @@ bool seek_switch_found() {
 
 
 void seek_end() {
-  switch_id_t seekMode;
-
-  seekMode = seek_get_switch();
-
   if (!seek.active) return;
 
   if (!(SEEK_FOUND & seek.flags) && (SEEK_ERROR & seek.flags))
     STATUS_WARNING(STAT_SEEK_NOT_FOUND, "", 0);
 
-  if((seekMode == SW_STALL_0) || (seekMode == SW_STALL_1) || (seekMode ==SW_STALL_2) || (seekMode == SW_STALL_3))
-    disable_stall_microstep();
-  
+  _restore_stall_microstep();
+
   seek.active = false;
 }
 
 
 void seek_cancel() {
-  switch_id_t seekMode;
-
-  seekMode = seek_get_switch();
-
-
-  if((seekMode == SW_STALL_0) || (seekMode == SW_STALL_1) || (seekMode ==SW_STALL_2) || (seekMode == SW_STALL_3))
-    disable_stall_microstep();
+  // Also used on queue flush: if a stall seek had already executed (and
+  // so switched microsteps) its restore must not be lost with the queue.
+  _restore_stall_microstep();
 
   seek.active = false;
 }
@@ -113,11 +129,11 @@ stat_t command_seek(char *cmd) {
   uint8_t flags = decode_hex_nibble(cmd[2]);
   if (flags & 0xfc) return STAT_INVALID_ARGUMENTS;
 
-  //////////////
-  if(sw == SW_STALL_0) enable_stall_microstep(0);
-  if(sw == SW_STALL_1) enable_stall_microstep(1);
-  if(sw == SW_STALL_2) enable_stall_microstep(2);
-  if(sw == SW_STALL_3) enable_stall_microstep(3);
+  // AVR-3: do NOT enable stall microsteps here.  This function runs at
+  // parse/queue time while earlier moves may still be executing in the
+  // old step space; switching steps_per_unit now would invalidate them.
+  // The switch happens in command_seek_exec() instead.  A seek that is
+  // flushed before executing therefore never disturbs the configuration.
 
   seek_t seek = {true, sw, flags};
   command_push(*cmd, &seek);
@@ -128,12 +144,10 @@ stat_t command_seek(char *cmd) {
 
 unsigned command_seek_size() {return sizeof(seek_t);}
 void command_seek_exec(void *data) {
-    //switch_id_t seekMode;
-
-    //seekMode = seek_get_switch();
-
-    //if((seekMode == SW_STALL_0) || (seekMode == SW_STALL_1) || (seekMode ==SW_STALL_2) || (seekMode == SW_STALL_3))
-    //    enable_stall_microstep();
-    
     seek = *(seek_t *)data;
+
+    // AVR-3: switch to stall microsteps now, at execution time, when all
+    // previously queued moves have completed in the old step space.
+    stall_motor = _stall_motor_for_switch(seek.sw);
+    if (0 <= stall_motor) enable_stall_microstep(stall_motor);
 }

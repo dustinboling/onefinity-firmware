@@ -214,7 +214,8 @@ static struct ktermios *_get_term(void) {
 
   // Baud rate
   unsigned brd = _read(UART011_IBRD) << 6 | _read(UART011_FBRD);
-  speed_t baud = clk_get_rate(_port.clk) * 4 / brd;
+  // AVR-11: brd is 0 before the first baud rate is set; don't divide by it
+  speed_t baud = brd ? clk_get_rate(_port.clk) * 4 / brd : 0;
   tty_termios_encode_baud_rate(&_port.term, baud, baud);
 
   // Data bits
@@ -246,8 +247,12 @@ static struct ktermios *_get_term(void) {
 }
 
 
-static void _set_baud(speed_t baud) {
+static int _set_baud(speed_t baud) {
   if (debug) printk(KERN_INFO "bbserial: baud=%d\n", baud);
+
+  // AVR-11: baud == 0 is a valid termios value (B0, hangup).  Dividing by
+  // it in kernel code faults; reject it and keep the previous rate.
+  if (!baud) return -EINVAL;
 
   unsigned brd = clk_get_rate(_port.clk) * 16 / baud;
 
@@ -256,6 +261,8 @@ static void _set_baud(speed_t baud) {
 
   _write(brd & 0x3f, UART011_FBRD);
   _write(brd >> 6,   UART011_IBRD);
+
+  return 0;
 }
 
 
@@ -285,13 +292,19 @@ static int _set_term(struct ktermios *term) {
   // Get baud rate
   speed_t baud = tty_termios_baud_rate(term);
 
+  // AVR-11: reject B0 before touching the hardware so a hangup termios
+  // cannot take the UART down mid-job
+  if (!baud) return -EINVAL;
+
   // Set
   unsigned long flags;
   spin_lock_irqsave(&_port.lock, flags);
 
-  // Hardware flow control
+  // Hardware flow control (AVR-22: two-way, so CRTSCTS can be turned
+  // back off again; the old code only ever set the bit)
   unsigned cr = _read(UART011_CR);
   if (cflag & CRTSCTS) cr |= UART011_CR_CTSEN;
+  else cr &= ~UART011_CR_CTSEN;
 
   _write(0, UART011_CR);      // Disable
   _set_baud(baud);            // Baud
@@ -390,12 +403,30 @@ static ssize_t _dev_read(struct file *filep, char *buffer, size_t len,
 
   ssize_t bytes = 0;
 
-  while (bytes < len && RING_BUF_FILL(_port.rx_buf)) {
-    put_user(RING_BUF_PEEK(_port.rx_buf), buffer++);
-    RING_BUF_POP(_port.rx_buf);
-    bytes++;
-    if (!_rx_enabled()) _enable_rx();
+  // AVR-18: copy in at most two contiguous chunks (up to the ring wrap)
+  // instead of one put_user() per byte on the G-code stream, and
+  // re-enable RX once at the end rather than per byte.
+  while (bytes < len) {
+    unsigned fill = RING_BUF_FILL(_port.rx_buf);
+    if (!fill) break;
+
+    unsigned chunk = len - bytes;
+    if (chunk > fill) chunk = fill;
+
+    unsigned to_wrap = BUF_SIZE - _port.rx_buf.tail;
+    if (chunk > to_wrap) chunk = to_wrap;
+
+    if (copy_to_user(buffer + bytes,
+                     &_port.rx_buf.buf[_port.rx_buf.tail], chunk)) {
+      if (!bytes) return -EFAULT;
+      break;
+    }
+
+    _port.rx_buf.tail = (_port.rx_buf.tail + chunk) & (BUF_SIZE - 1);
+    bytes += chunk;
   }
+
+  if (bytes && !_rx_enabled()) _enable_rx();
 
   return bytes ? bytes : -EAGAIN;
 }
@@ -409,12 +440,31 @@ static ssize_t _dev_write(struct file *filep, const char *buffer, size_t len,
 
   ssize_t bytes = 0;
 
-  while (bytes < len && RING_BUF_SPACE(_port.tx_buf)) {
-    get_user(RING_BUF_POKE(_port.tx_buf), buffer++);
-    RING_BUF_INC(_port.tx_buf, head);
-    bytes++;
-    if (!_tx_enabled()) _enable_tx();
+  // AVR-18: as in _dev_read(), copy in contiguous chunks (at most two,
+  // up to the ring wrap) instead of one get_user() per byte, publish
+  // the head once per chunk, and enable TX once at the end.
+  while (bytes < len) {
+    unsigned space = RING_BUF_SPACE(_port.tx_buf);
+    if (!space) break;
+
+    unsigned chunk = len - bytes;
+    if (chunk > space) chunk = space;
+
+    unsigned to_wrap = BUF_SIZE - _port.tx_buf.head;
+    if (chunk > to_wrap) chunk = to_wrap;
+
+    if (copy_from_user(&_port.tx_buf.buf[_port.tx_buf.head],
+                       buffer + bytes, chunk)) {
+      if (!bytes) return -EFAULT;
+      break;
+    }
+
+    mb(); // Data must be visible before the head is published
+    _port.tx_buf.head = (_port.tx_buf.head + chunk) & (BUF_SIZE - 1);
+    bytes += chunk;
   }
+
+  if (bytes && !_tx_enabled()) _enable_tx();
 
   return bytes ? bytes : -EAGAIN;
 }
@@ -459,7 +509,10 @@ static long _dev_ioctl(struct file *file, unsigned cmd, unsigned long arg) {
   switch (cmd) {
   case TCGETS: { // Get serial port settings
     struct ktermios *term = _get_term();
-    if (copy_to_user((void __user *)arg, &term, sizeof(struct termios)))
+    // AVR-5: _get_term() already returns a pointer.  Copying from &term
+    // (the address of the local pointer variable) leaked kernel stack
+    // contents to userspace instead of the port settings.
+    if (copy_to_user((void __user *)arg, term, sizeof(struct termios)))
       return -EFAULT;
     return 0;
   }
@@ -472,21 +525,23 @@ static long _dev_ioctl(struct file *file, unsigned cmd, unsigned long arg) {
   }
 
   case TIOCMGET: // Get status of modem bits
-    put_user(_read_status(), ptr);
-    return 0;
+    // AVR-22: put_user() returns -EFAULT on a bad pointer; propagate it
+    return put_user(_read_status(), ptr);
 
   case TIOCMSET: // Set status of modem bits
-    get_user(status, ptr);
+    // AVR-22: a failed get_user() left 'status' as uninitialised stack,
+    // which was then written to the UART control register
+    if (get_user(status, ptr)) return -EFAULT;
     _write_status(status);
     return 0;
 
   case TIOCMBIC: // Clear indicated modem bits
-    get_user(status, ptr);
+    if (get_user(status, ptr)) return -EFAULT;
     _write_status(~status & _read_status());
     return 0;
 
   case TIOCMBIS: // Set indicated modem bits
-    get_user(status, ptr);
+    if (get_user(status, ptr)) return -EFAULT;
     _write_status(status | _read_status());
     return 0;
 

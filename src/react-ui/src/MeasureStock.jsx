@@ -107,6 +107,7 @@ export default function MeasureStock({ config, state, send, subscribe, metric, o
       if (!cal || !loc) throw new Error("The bed camera's result is gone. Find the stock again, or jog by hand.");
       const z = computeAxis(state, config, "z", true);
       const r = await runCam(moveOverProgram({ top: z.max - 1, x: c.cx, y: c.cy, zStop: cal.zBed + 2, travel: p.travel, fast: config.probe["probe-fast-seek"], slow: config.probe["probe-slow-seek"], above: 8 }));
+      if (r.notStarted) throw new Error("The move never started — the controller didn't take it, most likely because the connection dropped. Check the connection and try again.");
       if (r.estop || r.xx === "ESTOPPED") throw new Error("The machine stopped (E-stop) while moving over the stock.");
       if (r.ofb_ok !== 1) { patch({ camMove: { state: "missed" } }); return; }
       const t = r.ofb_top - cal.zBed;
@@ -130,7 +131,7 @@ export default function MeasureStock({ config, state, send, subscribe, metric, o
     patch({ finding: true, findErr: null, driver: ME });
     try {
       const z = computeAxis(state, config, "z", true), x = computeAxis(state, config, "x", true), y = computeAxis(state, config, "y", true);
-      const runOk = async (prog) => { const r = await runCam(prog); if (r.estop || r.xx === "ESTOPPED") throw new Error("The machine stopped (E-stop) while parking."); return r; };
+      const runOk = async (prog) => { const r = await runCam(prog); if (r.notStarted) throw new Error("The move never started — the controller didn't take it, most likely because the connection dropped."); if (r.estop || r.xx === "ESTOPPED") throw new Error("The machine stopped (E-stop) while parking."); return r; };
       const res = await locateStock({ runOk, top: z.max - 1, lim: { x0: x.min, x1: x.max, y0: y.min, y1: y.max } });
       const l = res.located;
       patch((d) => ({ finding: false, auto: true, camMove: null,

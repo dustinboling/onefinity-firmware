@@ -22,8 +22,28 @@ update-rc.d avahi-daemon defaults
 # Change hostname
 sed -i "s/raspberrypi/bbctrl/" /etc/hosts /etc/hostname
 
-# Create bbmc user
-useradd -m -p $(openssl passwd -1 buildbotics) -s /bin/bash bbmc
+# Create bbmc user (Scripts-6: no hard-coded, published password).
+# The password is per-device: taken from $BBMC_PASSWORD when the
+# image builder provides one, otherwise generated randomly for this
+# device.  It is stored hashed with SHA-512 (via chpasswd/PAM, not
+# MD5-crypt), must be changed at first login, and a generated
+# password is left in a root-only file for the factory operator --
+# it is never a constant shared between images.
+if [ -n "${BBMC_PASSWORD:-}" ]; then
+    BBMC_PW="$BBMC_PASSWORD"
+    BBMC_PW_GENERATED=false
+else
+    BBMC_PW="$(openssl rand -base64 18)"
+    BBMC_PW_GENERATED=true
+fi
+useradd -m -s /bin/bash bbmc
+printf 'bbmc:%s\n' "$BBMC_PW" | chpasswd
+chage -d 0 bbmc # Force a password change on first login
+if $BBMC_PW_GENERATED; then
+    umask 077
+    printf '%s\n' "$BBMC_PW" > /root/bbmc-initial-password.txt
+    echo "Generated a per-device password for user 'bbmc'; see /root/bbmc-initial-password.txt (delete it after first login)"
+fi
 sed -i 's/pi$/pi,bbmc/g' /etc/group
 passwd -l pi
 
@@ -65,8 +85,11 @@ echo -e "\n# Dynamic clock\nnohz=on" >> /boot/config.txt
 # Shave 2 sec off of boot time
 echo -e "\n# Faster boot\ndtparam=sd_overclock=100" >> /boot/config.txt
 
-# Enable ssh
-touch /boot/ssh
+# SSH is NOT enabled in the factory image (Scripts-6).  It used to be
+# switched on here while the only account had a published password.
+# To enable it on a specific device, change the account password
+# first and then create the file /boot/ssh.
+rm -f /boot/ssh
 
 # Fix boot
 sed -i 's/ root=[^ ]* / root=\/dev\/mmcblk0p2/' /boot/cmdline.txt
@@ -91,18 +114,47 @@ plymouth-set-default-theme -R buildbotics
 
 # Samba
 # TODO install custom smb.conf
-smbpasswd -a bbmc
+# Set the Samba password to the same per-device password as the OS
+# account (which is forced to change at first OS login).
+printf '%s\n%s\n' "$BBMC_PW" "$BBMC_PW" | smbpasswd -a -s bbmc
+unset BBMC_PW BBMC_PASSWORD
 
-# Install bbctrl
-tar xf /mnt/host/bbctrl-*.tar.bz2
-cd $(basename bbctrl-*.tar.bz2 .tar.bz2)
+# Install bbctrl -- extract the package with the same care as the
+# update path (Scripts-4): validate member names first, extract with
+# safe options into a fresh directory, and use the canonical package
+# name (Scripts-7).
+PKG_FILE="$(compgen -G '/mnt/host/onefinity-*.tar.bz2' | head -n 1 || true)"
+if [ -z "$PKG_FILE" ]; then
+    echo "No onefinity-*.tar.bz2 package found in /mnt/host" >&2
+    exit 1
+fi
+tar -tjf "$PKG_FILE" | while IFS= read -r member; do
+    case "$member" in
+        /*|../*|*/../*|*/..|..)
+            echo "Unsafe member in $PKG_FILE: $member" >&2; exit 1 ;;
+    esac
+done
+PKG_DIR="$(basename "$PKG_FILE" .tar.bz2)"
+rm -rf "/tmp/${PKG_DIR}"
+mkdir -p "/tmp/${PKG_DIR}"
+tar --no-same-owner --no-same-permissions --delay-directory-restore \
+    -xjf "$PKG_FILE" -C /tmp
+cd "/tmp/${PKG_DIR}"
 ./setup.py install
-cd ..
-rm -rf $(basename bbctrl-*.tar.bz2 .tar.bz2)
+cd /mnt/host
+rm -rf "/tmp/${PKG_DIR}"
 
 
-# Allow any user to shutdown
-chmod +s /sbin/{halt,reboot,shutdown,poweroff}
+# Shutdown is via sudo for the one account that needs it -- NOT via
+# setuid-root halt/reboot/shutdown/poweroff binaries (Scripts-6).
+cat > /etc/sudoers.d/bbctrl-shutdown <<'EOF'
+# Allow the bbmc account to shut the controller down through sudo.
+bbmc ALL=(root) NOPASSWD: /sbin/halt, /sbin/reboot, /sbin/shutdown, /sbin/poweroff
+EOF
+chmod 440 /etc/sudoers.d/bbctrl-shutdown
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/bbctrl-shutdown
+fi
 
 # Clean up
 apt-get autoremove -y

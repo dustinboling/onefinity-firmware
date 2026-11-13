@@ -2,9 +2,17 @@
 
 # Downloads the newest firmware from the latest GitHub release of
 # mikejsmith1985/onefinity-firmware and installs it.
+#
+# The downloaded package is verified against the SHA-256 digest
+# published for the release asset (the GitHub API "digest" field, or a
+# "<package>.sha256" asset when the API digest is absent) before it
+# replaces the previously staged package, and the digest is kept as a
+# sidecar so update-bbctrl re-verifies the exact bytes it installs
+# (audit findings Scripts-1, 22).  If the release provides no digest
+# at all the upgrade refuses to proceed -- fail closed.
 
 (
-    flock -n 9
+    flock -n 9 || { echo "upgrade-bbctrl: another upgrade is already in progress" >&2; exit 1; }
 
     REPO=mikejsmith1985/onefinity-firmware
     PKG=/var/lib/bbctrl/firmware/update.tar.bz2
@@ -13,15 +21,36 @@
     mkdir -p firmware
 
     # Newest published release (drafts and pre-releases are not returned)
-    INFO=$(curl -fsSL --max-time 30 https://api.github.com/repos/$REPO/releases/latest)
-    PKG_URL=$(echo "$INFO" | python3 -c '
+    INFO=$(curl -fsSL --max-time 30 "https://api.github.com/repos/$REPO/releases/latest")
+
+    # Find the firmware asset, accepting the documented "-pN" patch
+    # suffix (Scripts-7), and its published SHA-256 digest if the API
+    # provides one.
+    read -r PKG_URL PKG_DIGEST DIGEST_URL SIG_URL <<EOF || true
+$(echo "$INFO" | python3 -c '
 import json, sys, re
 rel = json.load(sys.stdin)
+pat = re.compile(r"^onefinity-[0-9]+(\.[0-9]+)*(-p[0-9]+)?\.tar\.bz2$")
+asset = None
+digest_url = ""
+sig_url = ""
 for a in rel.get("assets", []):
-    if re.match(r"^onefinity-[0-9.]+\.tar\.bz2$", a["name"]):
-        print(a["browser_download_url"])
+    if pat.match(a["name"]):
+        asset = a
         break
+if asset is not None:
+    digest = asset.get("digest") or ""
+    if digest.startswith("sha256:"):
+        digest = digest[len("sha256:"):]
+    for a in rel.get("assets", []):
+        if a["name"] == asset["name"] + ".sha256":
+            digest_url = a["browser_download_url"]
+        if a["name"] == asset["name"] + ".sig":
+            sig_url = a["browser_download_url"]
+    print(asset["browser_download_url"], digest, digest_url, sig_url)
 ')
+EOF
+
     VERSION=$(echo "$INFO" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
 
     if [ -z "$PKG_URL" ]; then
@@ -29,20 +58,58 @@ for a in rel.get("assets", []):
         exit 1
     fi
 
-    logger Installing onefinity firmware $VERSION
+    # Resolve the expected digest: API digest first, then the
+    # published .sha256 asset.  No digest, no upgrade (Scripts-1).
+    EXPECTED_SHA256="$PKG_DIGEST"
+    if [ -z "$EXPECTED_SHA256" ] && [ -n "$DIGEST_URL" ]; then
+        EXPECTED_SHA256=$(curl -fsSL --max-time 30 "$DIGEST_URL" | awk 'NR == 1 {print $1}')
+    fi
+    if ! [[ "$EXPECTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "Latest release $VERSION publishes no SHA-256 digest for its firmware asset; refusing to upgrade" >&2
+        exit 1
+    fi
+    EXPECTED_SHA256="${EXPECTED_SHA256,,}"
 
-    echo Downloading $PKG_URL
-    rm -f $PKG
-    curl -fsSL --max-time 600 -o $PKG.part "$PKG_URL"
+    logger "Installing onefinity firmware $VERSION"
+
+    # Download to a .part file first.  The previously staged package
+    # (if any) is left untouched until the new download is fully
+    # verified -- the final mv replaces it atomically on the same
+    # filesystem (Scripts-22).
+    echo "Downloading $PKG_URL"
+    curl -fsSL --max-time 600 -o "$PKG.part" "$PKG_URL"
+
+    # Fetch the detached signature too, when the release publishes
+    # one; update-bbctrl verifies it before installing (Scripts-1).
+    if [ -n "$SIG_URL" ]; then
+        curl -fsSL --max-time 60 -o "$PKG.sig.part" "$SIG_URL"
+    fi
 
     # Never install a partial or corrupt download
-    bzip2 -t $PKG.part
-    mv $PKG.part $PKG
+    bzip2 -t "$PKG.part"
+
+    # Never install a download whose digest does not match the release
+    echo "$EXPECTED_SHA256  $PKG.part" | sha256sum -c -
+
+    mv "$PKG.part" "$PKG"
+    # The sidecars describe the staged package: replace or remove
+    # them together with it, never leave a stale one behind.
+    if [ -e "$PKG.sig.part" ]; then
+        mv "$PKG.sig.part" "$PKG.sig"
+    else
+        rm -f "$PKG.sig"
+    fi
+
+    # Keep the verified digest next to the package; update-bbctrl
+    # re-checks it before installing (Scripts-1).
+    printf '%s  %s\n' "$EXPECTED_SHA256" "$(basename "$PKG")" > "$PKG.sha256.tmp"
+    mv "$PKG.sha256.tmp" "$PKG.sha256"
+    sync
 
     /usr/local/bin/update-bbctrl
 
     echo Success
 
-    logger bbctrl firmware $VERSION installed
+    logger "bbctrl firmware $VERSION installed"
 
 ) 9> /var/lock/bbctrl.upgrade.lock

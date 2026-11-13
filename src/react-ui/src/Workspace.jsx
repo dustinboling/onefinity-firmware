@@ -13,7 +13,7 @@ import { useNote } from "./notes.js";
 
 const TABS = [["depth", "Depth view"], ["path", "Tool path"], ["gcode", "G-code"], ["files", "Files"], ["mdi", "MDI"], ["notes", "Notes"], ["history", "History"], ["messages", "Messages"], ["indicators", "Indicators"], ["camera", "Camera"]];
 
-export default function Workspace({ lines, state, path, pathBusy, send, mach, cfg, idle, logs, clearLogs, subscribe, onMeasure }) {
+export default function Workspace({ lines, tooLarge, state, path, pathBusy, pathErr, send, mach, cfg, idle, logs, clearLogs, subscribe, onMeasure }) {
   const [tab, setTab] = useState(() => { try { return localStorage.getItem("next-work") || "depth"; } catch { return "depth"; } });
   const hasNote = !!useNote(state.selected);
   const pick = (t) => { setTab(t); try { localStorage.setItem("next-work", t); } catch {} };
@@ -27,9 +27,9 @@ export default function Workspace({ lines, state, path, pathBusy, send, mach, cf
         ))}
       </div>
       <div className="pane">
-        {tab === "depth" && <DepthView path={path} busy={pathBusy} file={state.selected} />}
-        {tab === "path" && <PathView path={path} busy={pathBusy} state={state} />}
-        {tab === "gcode" && <GCode state={state} lines={lines} />}
+        {tab === "depth" && <DepthView path={path} busy={pathBusy} err={pathErr} file={state.selected} />}
+        {tab === "path" && <PathView path={path} busy={pathBusy} err={pathErr} state={state} />}
+        {tab === "gcode" && <GCode line={state.line} selected={state.selected} lines={lines} tooLarge={tooLarge} />}
         {tab === "files" && <Files state={state} cfg={cfg} idle={idle} />}
         {tab === "mdi" && <Mdi state={state} send={send} mach={mach} />}
         {tab === "notes" && <Notes file={state.selected} />}

@@ -5,15 +5,19 @@ import { usePref, setPref } from "./shared.js";
 
 export default function Mdi({ state, send, mach }) {
   const [text, setText] = useState("");
+  const [err, setErr] = useState("");
   // Command history is shared by every screen.
   const hist = usePref("mdi.hist", []);
   const can = state.cycle === "idle" || state.cycle === "mdi";
   const running = mach === "RUNNING", holding = mach === "HOLDING" || mach === "STOPPING";
   // Takes the box's own text: with the touch-screen keyboard the state can be a keystroke behind.
+  // Only clear the box and record the command when it actually went out: a command typed while
+  // the connection was down must not look as if it ran.
   const submit = (raw = text) => {
     const cmd = String(raw).trim();
     if (!cmd || !can) return;
-    send(cmd);
+    if (send(cmd) === false) { setErr("Not connected — command not sent."); return; }
+    setErr("");
     const h = [cmd, ...hist.filter((x) => x !== cmd)].slice(0, 30);
     setPref("mdi.hist", h);
     setText("");
@@ -29,6 +33,7 @@ export default function Mdi({ state, send, mach }) {
           : <button className="go" disabled={!can || !text.trim()} onClick={() => submit()}>Run</button>}
         <button className="halt" onClick={() => api.put("stop")}>Stop</button>
       </div>
+      {err && <p className="err" role="alert">{err}</p>}
       <p className="dim">The machine is working in <b>{state.metric === false ? "imperial" : "metric"}</b> units. Use G20 or G21 to switch.</p>
       {hist.length === 0 ? <p className="empty">Commands you run appear here. Click one to reuse it.</p> : (
         <ul className="hist">{hist.map((h, i) => <li key={i}><button onClick={() => setText(h)}>{h}</button></li>)}</ul>

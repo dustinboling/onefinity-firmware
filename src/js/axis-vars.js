@@ -84,18 +84,23 @@ module.exports = {
                 icon = "check-circle";
             }
 
-            if (0 < dim && dim < pathDim) {
-                tstate = "NO FIT";
-                tklass += " error";
-                ticon = "ban";
-            } else {
-                if (over || under) {
-                    tstate = over ? "OVER" : "UNDER";
-                    tklass += " warn";
-                    ticon = "exclamation-circle";
+            // With no program loaded the path bounds are undefined, so pathDim is NaN and
+            // every comparison is false: without this guard the axis reported "OK" when
+            // no fit check was possible at all (the React UI guards with isFinite too).
+            if (isFinite(pathDim) && isFinite(off)) {
+                if (0 < dim && dim < pathDim) {
+                    tstate = "NO FIT";
+                    tklass += " error";
+                    ticon = "ban";
                 } else {
-                    tstate = "OK";
-                    ticon = "check-circle";
+                    if (over || under) {
+                        tstate = over ? "OVER" : "UNDER";
+                        tklass += " warn";
+                        ticon = "exclamation-circle";
+                    } else {
+                        tstate = "OK";
+                        ticon = "check-circle";
+                    }
                 }
             }
 
@@ -150,6 +155,10 @@ module.exports = {
                         `(${this._length_str(pathDim)}) exceed axis dimensions`,
                         `(${this._length_str(dim)}) by ${this._length_str(pathDim - dim)}.`
                     ].join(" ");
+                    break;
+
+                case "NO FILE":
+                    toolmsg = `No tool path file loaded for ${axis}.`;
                     break;
 
                 default:

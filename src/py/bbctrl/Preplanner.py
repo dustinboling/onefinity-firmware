@@ -226,7 +226,12 @@ class Plan(object):
 
 
 class Preplanner(object):
-    def __init__(self, ctrl, max_plan_time = 60 * 60 * 24, max_loop_time = 300):
+    # P-19: at most this many plans are kept (each is a planner
+    # subprocess plus its positions/speeds blobs in RAM).  Old finished
+    # plans are evicted LRU-style when a new file needs the room.
+    MAX_PLANS = 4
+
+    def __init__(self, ctrl, max_plan_time = 60 * 10, max_loop_time = 300):
         self.ctrl = ctrl
         self.log = ctrl.log.get('Preplanner')
 
@@ -279,8 +284,19 @@ class Preplanner(object):
         # A plan dropped while we wait (an upload is followed by a settings
         # save of the folder lists, a re-upload, ...) hands over to the new one
         for attempt in range(10):
-            if filename in self.plans: plan = self.plans[filename]
+            if filename in self.plans:
+                plan = self.plans[filename]
+                # LRU: re-insert so eviction drops the stalest first
+                self.plans[filename] = self.plans.pop(filename)
             else:
+                # P-19: bound the cache.  Evict finished plans oldest
+                # first; plans still running are left alone (the cap
+                # is a soft bound while real work is in flight).
+                while len(self.plans) >= self.MAX_PLANS:
+                    done = [n for n, p in self.plans.items()
+                            if p.future.done()]
+                    if not done: break
+                    self.invalidate(done[0])
                 plan = Plan(self, self.ctrl, filename)
                 self.plans[filename] = plan
 

@@ -222,6 +222,27 @@ void usart_putc(char c) {
 }
 
 
+bool usart_try_putc(char c) {
+  // AVR-24: non-blocking variant of usart_putc().  Returns false
+  // instead of spinning when the TX ring is full (or a flush is in
+  // progress).  For printing from contexts that must not block, e.g.
+  // status messages raised from interrupt-adjacent code, where a full
+  // ring would otherwise stall or deadlock the caller until the ring
+  // drains at line rate (~44ms for a full ring at 230400 baud).
+  if (tx_buf_full() || _flush) return false;
+  tx_buf_push(c);
+  _set_dre_interrupt(true); // Enable interrupt
+  return true;
+}
+
+
+bool usart_try_puts(const char *s) {
+  while (*s)
+    if (!usart_try_putc(*s++)) return false;
+  return true;
+}
+
+
 void usart_puts(const char *s) {while (*s) usart_putc(*s++);}
 
 

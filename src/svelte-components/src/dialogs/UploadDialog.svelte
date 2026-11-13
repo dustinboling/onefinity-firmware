@@ -32,11 +32,25 @@
         progress = 0;
 
         xhr = new XMLHttpRequest();
-        xhr.upload.onload = () => {
-            open = false;
-            if (onComplete) {
-                onComplete();
+        // Success is decided by the response, not by the request bytes having been
+        // sent (xhr.upload.onload): a rejected upload used to close the dialog and
+        // run onComplete exactly like a good one.
+        xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                open = false;
+                if (onComplete) {
+                    onComplete();
+                }
+            } else {
+                alert(
+                    `Upload failed: the controller answered ${xhr.status}` +
+                        (xhr.responseText ? `: ${xhr.responseText}` : ".")
+                );
             }
+        };
+
+        xhr.onerror = () => {
+            alert("Upload failed.");
         };
 
         xhr.upload.onerror = () => {

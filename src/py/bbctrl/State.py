@@ -167,13 +167,18 @@ class State(object):
             self.set('files', files)
 
         if self.get('selected', filename) == filename:
-            if len(files): self.select_file('')
-            else: self.select_file('')
+            self.select_file('')
 
 
     def select_file(self, filename):
         self.set('selected', filename)
-        time = os.path.getmtime(self.ctrl.get_upload(filename))
+        # P-20: a delete can race the file-list refresh (watchdog thread
+        # or a request); an unguarded getmtime raised FileNotFoundError
+        # out of load_files and could kill the observer callback chain.
+        try:
+            time = os.path.getmtime(self.ctrl.get_upload(filename))
+        except OSError:
+            time = 0
         self.set('selected_time', time)
 
 
@@ -192,11 +197,15 @@ class State(object):
         self.set('messages', msgs)
 
 
+    # P-13: the message list used to grow for the life of the process
+    # and be copied + re-broadcast whole on every new message.
+    MAX_MESSAGES = 100
+
     def add_message(self, text):
         msg = dict(text = text, id = self.message_id)
         self.message_id += 1
         msgs = self.vars['messages']
-        msgs = msgs + [msg] # It's important we make a new list here
+        msgs = (msgs + [msg])[-self.MAX_MESSAGES:] # It's important we make a new list here
         self.set('messages', msgs)
 
 

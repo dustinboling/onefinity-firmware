@@ -2,7 +2,7 @@ import os
 import re
 import math
 
-from bbctrl import GCodeText
+from bbctrl import GCodeText, Work
 
 # Camera alignment: rotate a program in the XY plane so it lines up with a
 # part that sits at an angle on the table.
@@ -212,13 +212,29 @@ def output_name(source):
     return PREFIX + source
 
 
+def _align_job(path, source, angle, tmp):
+    '''The heavy half of Align.build (P-08): read + transform the whole
+    program and write the result to `tmp`; the caller replaces it into
+    place.  Pure file work for the Work worker process.'''
+    with open(path, 'r', encoding = 'utf-8', errors = 'replace') as f:
+        lines = f.read().splitlines()
+
+    text, info = transform(lines, angle, source)
+
+    with open(tmp, 'w', encoding = 'utf-8') as f: f.write(text)
+    return info
+
+
 class Align(object):
     def __init__(self, ctrl):
         self.ctrl = ctrl
         self.log = ctrl.log.get('Align')
 
 
-    def build(self, source, angle):
+    # P-08: like Resume/DoOver, the whole-file read + transform runs
+    # in the worker process; only validation and the final replace
+    # stay on the IOLoop.
+    def _build_steps(self, source, angle):
         ctrl = self.ctrl
         if ctrl.state.get('cycle') != 'idle':
             raise AlignError('Wait until the machine is idle.')
@@ -236,18 +252,26 @@ class Align(object):
         try: angle = float(angle)
         except (TypeError, ValueError): raise AlignError('Bad angle.')
 
-        with open(path, 'r', encoding = 'utf-8', errors = 'replace') as f:
-            lines = f.read().splitlines()
-
-        text, info = transform(lines, angle, source)
-
         name = output_name(source)
         tmp = ctrl.get_upload(name + '.tmp')
-        with open(tmp, 'w', encoding = 'utf-8') as f: f.write(text)
-        os.replace(tmp, ctrl.get_upload(name))
+        try:
+            info = yield (_align_job, (path, source, angle, tmp))
+            os.replace(tmp, ctrl.get_upload(name))
+        except BaseException:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
         ctrl.state.add_file(name)
 
         self.log.info('Wrote %s rotated %.3f degrees' % (name, angle))
         info['file'] = name
         info['source'] = source
         return info
+
+
+    def build(self, source, angle):
+        return Work.drive_sync(self._build_steps(source, angle))
+
+
+    def build_async(self, source, angle):
+        return Work.drive(self._build_steps(source, angle))

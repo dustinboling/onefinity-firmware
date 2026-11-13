@@ -13,14 +13,20 @@ export function parseToolChanges(lines) {
   return out;
 }
 
+// Same guard the legacy viewer had: above this the G-code tab is disabled rather than
+// splitting (and rendering) a program with hundreds of thousands of lines.
+export const MAX_PROGRAM_CHARS = 20e6;
+
 export function useProgram(state) {
-  const [lines, setLines] = useState([]);
+  const [doc, setDoc] = useState({ lines: [], tooLarge: false });
   useEffect(() => {
-    if (!state.selected) { setLines([]); return; }
+    if (!state.selected) { setDoc({ lines: [], tooLarge: false }); return; }
     let dead = false;
     fetch(`/api/file/${encodeURIComponent(state.selected)}`, { cache: "no-cache" })
-      .then((r) => r.text()).then((t) => !dead && setLines(t.split("\n"))).catch(() => !dead && setLines([]));
+      .then((r) => r.text())
+      .then((t) => { if (!dead) setDoc(t.length > MAX_PROGRAM_CHARS ? { lines: [], tooLarge: true } : { lines: t.split("\n"), tooLarge: false }); })
+      .catch(() => !dead && setDoc({ lines: [], tooLarge: false }));
     return () => { dead = true; };
   }, [state.selected, state.selected_time]);
-  return lines;
+  return doc;
 }

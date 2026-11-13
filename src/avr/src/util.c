@@ -64,9 +64,21 @@ int8_t decode_hex_nibble(char c) {
 
 
 bool decode_float(char **s, float *f) {
-  bool ok = b64_decode_float(*s, f) && isfinite(*f);
+  // AVR-17: a float field is exactly 6 base64 characters.  The old code
+  // always consumed (and the decoder always read) 6 characters, even
+  // for a truncated command at the end of the line buffer, so a
+  // malformed line could decode a "valid" float assembled partly from
+  // stale previous-line data instead of being rejected.  Require the
+  // full field to be present, and only advance on success.
+  for (int i = 0; i < 6; i++)
+    if (!(*s)[i]) return false;
+
+  float value;
+  if (!b64_decode_float(*s, &value) || !isfinite(value)) return false;
+
+  *f = value;
   *s += 6;
-  return ok;
+  return true;
 }
 
 

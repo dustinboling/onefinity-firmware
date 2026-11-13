@@ -3,7 +3,7 @@ import re
 import time
 import hashlib
 
-from bbctrl import GCodeText
+from bbctrl import GCodeText, Work
 
 # Builds a G-code program that continues an interrupted job, and parks the
 # machine so the job can be continued after the power is switched off.
@@ -417,6 +417,53 @@ def manual_spindle(config, ctrl = None):
     return tool_type.lower() == 'disabled' or selected.lower() in ('router', 'disabled')
 
 
+def _build_job(path, src, opts, top_mm, manual, work, saved, sha):
+    '''The heavy half of Resume.build (P-08): hash, read and scan the
+    whole program and build the restart program.  Pure file work, so
+    Work can run it in the worker process.  `work` is the tool's current
+    work position, captured by the caller; `sha` the checkpoint's
+    fingerprint of the program (or None).'''
+    changed = bool(sha) and sha_of(path) != sha
+
+    with open(path, 'r', encoding = 'utf-8', errors = 'replace') as f:
+        lines = f.read().splitlines()
+
+    line = saved
+    notes = []
+
+    # Where is the tool right now?  The saved line can be behind the
+    # machine, and after a controlled stop the tool is still on the path.
+    # If it is, restart there.  After a power loss the machine has been
+    # homed away from the path, so there is no match and the saved line is used.
+    found = None
+    if work is not None:
+        try: found = locate(lines, work, saved)
+        except Exception: found = None
+
+    if found:
+        line = found[0]
+        if line != saved:
+            notes.append('The tool is on the program path at line %d, ahead of the '
+                         'saved line %d, so the program restarts at line %d.'
+                         % (line, saved, line))
+
+    if changed:
+        if not found:
+            raise ResumeError('%s has changed since the job was interrupted, and '
+                              'the tool is not on its path, so the saved line cannot '
+                              'be trusted. Start the job again.' % src)
+        notes.append('%s was changed after the job was interrupted. The restart point '
+                     'was found from where the tool is, not from the saved line.' % src)
+
+    router = GCodeText.setup_fields(lines[:400]).get('router', '')
+    text, info = build(lines, line, src, opts, top_mm,
+                       manual = manual, router = router)
+    info['saved_line'] = saved
+    info['located'] = bool(found)
+    info['warnings'] = notes + info['warnings']
+    return text, info
+
+
 class Resume(object):
     def __init__(self, ctrl):
         self.ctrl = ctrl
@@ -444,7 +491,12 @@ class Resume(object):
 
 
     # Build --------------------------------------------------------------
-    def build(self, opts):
+    # P-08: reading and scanning the whole program used to happen on
+    # the IOLoop in build().  Like DoOver, the heavy step now runs in
+    # the worker process via a step generator: state checks and the
+    # final os.replace/add_file stay here, the read/scan/build is
+    # yielded to Work.
+    def _build_steps(self, opts):
         cp = self.ctrl.checkpoint
         rec = cp.get() if cp else None
         if not rec or not rec.get('file') or rec.get('status') == 'dismissed':
@@ -457,49 +509,19 @@ class Resume(object):
         path = self.ctrl.get_upload(src)
         if not os.path.isfile(path):
             raise ResumeError('The program %s is no longer on the controller.' % src)
-        changed = bool(rec.get('sha')) and sha_of(path) != rec['sha']
-
-        with open(path, 'r', encoding = 'utf-8', errors = 'replace') as f:
-            lines = f.read().splitlines()
 
         saved = int(rec.get('line') or 0)
-        line = saved
-        notes = []
-
-        # Where is the tool right now?  The saved line can be behind the
-        # machine, and after a controlled stop the tool is still on the path.
-        # If it is, restart there.  After a power loss the machine has been
-        # homed away from the path, so there is no match and the saved line is used.
-        found = None
+        s = self.ctrl.state
         try:
-            s = self.ctrl.state
             work = dict((a, float(s.get(a + 'p', 0) or 0) - float(s.get('offset_' + a, 0) or 0))
                         for a in 'xyz')
-            found = locate(lines, work, saved)
-        except Exception as e: self.log.warning('Could not match the tool position: %s' % e)
-
-        if found:
-            line = found[0]
-            if line != saved:
-                notes.append('The tool is on the program path at line %d, ahead of the '
-                             'saved line %d, so the program restarts at line %d.'
-                             % (line, saved, line))
-
-        if changed:
-            if not found:
-                raise ResumeError('%s has changed since the job was interrupted, and '
-                                  'the tool is not on its path, so the saved line cannot '
-                                  'be trusted. Start the job again.' % src)
-            notes.append('%s was changed after the job was interrupted. The restart point '
-                         'was found from where the tool is, not from the saved line.' % src)
-
+        except Exception:
+            work = None
         manual = manual_spindle(self.ctrl.config, self.ctrl)
-        router = GCodeText.setup_fields(lines[:400]).get('router', '')
-        text, info = build(lines, line, src, opts, self._top_mm(),
-                           manual = manual, router = router)
-        info['saved_line'] = saved
-        info['located'] = bool(found)
-        info['warnings'] = notes + info['warnings']
+        top_mm = self._top_mm()
+
+        text, info = yield (_build_job, (path, src, opts, top_mm, manual,
+                                         work, saved, rec.get('sha')))
 
         name = output_name(src)
         tmp = self.ctrl.get_upload(name + '.tmp')
@@ -511,6 +533,14 @@ class Resume(object):
         info['source'] = src
         info.update(self._offset_check(rec))
         return info
+
+
+    def build(self, opts):
+        return Work.drive_sync(self._build_steps(opts))
+
+
+    def build_async(self, opts):
+        return Work.drive(self._build_steps(opts))
 
 
     # Put the work zero back where it was when the job stopped -------------

@@ -46,6 +46,30 @@ def clamp(v, lo, hi, default):
     return min(hi, max(lo, v))
 
 
+_HOSTNAME = None # compiled on first use
+
+def valid_plug_host(ip):
+    '''P-18: the plug address from the prefs document is interpolated
+    into a URL fetched every HEARTBEAT seconds.  Unchecked, values
+    containing '/', '?', '#', '@' or ':' turned that heartbeat into a
+    standing SSRF primitive against arbitrary LAN hosts/paths.  Only a
+    bare IPv4 address or a strict hostname is a plug address.'''
+    global _HOSTNAME
+    if not ip: return False
+    try:
+        import ipaddress
+        ipaddress.IPv4Address(ip)
+        return True
+    except Exception:
+        pass
+    if _HOSTNAME is None:
+        import re
+        _HOSTNAME = re.compile(
+            r'^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?'
+            r'(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$')
+    return len(ip) <= 253 and '..' not in ip and bool(_HOSTNAME.match(ip))
+
+
 class PlugLink(threading.Thread):
     '''Talks to one plug.  want(True/False/None) sets what the plug should be:
     on (re-armed every HEARTBEAT), off (switched off, then just watched), or
@@ -89,7 +113,11 @@ class PlugLink(threading.Thread):
             self.cv.notify()
 
 
-    def _rpc(self, ip, q): return self.opener('http://%s/rpc/%s' % (ip, q))
+    def _rpc(self, ip, q):
+        # P-18: defence in depth — never build a URL from an
+        # unvalidated host, whoever set it.
+        if not valid_plug_host(ip): raise ValueError('Bad plug address')
+        return self.opener('http://%s/rpc/%s' % (ip, q))
 
 
     def run(self):
@@ -173,7 +201,14 @@ class Plugs(object):
 
         for name in NAMES:
             q = p.get(name) if isinstance(p.get(name), dict) else {}
-            self.prefs[name] = {'ip': str(q.get('ip', '') or '').strip(),
+            ip = str(q.get('ip', '') or '').strip()
+            if ip and not valid_plug_host(ip):
+                # P-18: an invalid address is no address — the plug is
+                # simply unreachable, never a URL injection.
+                self.log.warning('Ignoring invalid %s plug address: %r'
+                                 % (name, ip))
+                ip = ''
+            self.prefs[name] = {'ip': ip,
                                 'auto': bool(q.get('auto', False))}
             self.links[name].set_ip(self.prefs[name]['ip'])
         self.prefs['spinup'] = clamp(p.get('spinup'), 0, 30, 4.0)

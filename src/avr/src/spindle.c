@@ -267,6 +267,10 @@ float get_max_spin() { return spindle.max_rpm; }
 
 void set_max_spin(float value)
 {
+  // AVR-13: a zero max RPM made inv_max_rpm +inf and pinned the power
+  // calculations to nonsense; negative/non-finite is equally invalid.
+  if (!isfinite(value) || value <= 0) return;
+
   if (spindle.max_rpm != value)
   {
     spindle.max_rpm = value;
@@ -279,6 +283,9 @@ float get_min_spin() { return spindle.min_rpm; }
 
 void set_min_spin(float value)
 {
+  // AVR-13: reject negative/non-finite values
+  if (!isfinite(value) || value < 0) return;
+
   if (spindle.min_rpm != value)
   {
     spindle.min_rpm = value;
@@ -305,11 +312,15 @@ uint16_t get_speed_override() { return spindle.override * 1000; }
 
 void set_speed_override(uint16_t value)
 {
-  value *= 0.001;
+  // AVR-14: the old code scaled in uint16_t, truncating the result back
+  // to an integer: any override below 100% became 0 (spindle stopped
+  // while the axes kept feeding) and 150% became 100%.  Overrides are
+  // in thousandths; scale in float, as set_feed_override() does.
+  float override = value * 0.001;
 
-  if (spindle.override != value)
+  if (spindle.override != override)
   {
-    spindle.override = value;
+    spindle.override = override;
     spindle_update_speed();
   }
 }

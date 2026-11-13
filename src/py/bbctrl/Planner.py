@@ -32,6 +32,7 @@ import time
 import os
 from collections import deque
 import camotics.gplan as gplan # pylint: disable=no-name-in-module,import-error
+import bbctrl
 import bbctrl.Cmd as Cmd
 from bbctrl.CommandQueue import CommandQueue, id_less
 
@@ -397,7 +398,12 @@ class Planner():
     def __encode(self, block):
         type, id = block['type'], block['id']
 
-        if type != 'set': self.log.info('Cmd:' + log_json(block))
+        # P-10: the 'Cmd:' trace stays at INFO — the fork's own test
+        # harnesses (seekharness) read it as the planner's observable
+        # trace — but the JSON is only serialised when INFO will
+        # actually be emitted, and Log no longer flushes per line.
+        if type != 'set' and bbctrl.log.would_log(self.log, bbctrl.log.INFO):
+            self.log.info('Cmd:' + log_json(block))
 
         if type == 'line':
             self._guard_line(block)

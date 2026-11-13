@@ -27,7 +27,7 @@ const saveEntry = (f, v) => {
   setPref("depth.files", all);
 };
 
-export default function DepthView({ path, busy: pathBusy, file }) {
+export default function DepthView({ path, busy: pathBusy, err, file }) {
   const [dia, setDia] = useState(parseFloat(load("dia", "3.175")) || 3.175);
   const [type, setType] = useState(load("type", "flat"));
   const [vAngle, setVAngle] = useState(parseFloat(load("vangle", "60")) || 60);
@@ -191,7 +191,7 @@ export default function DepthView({ path, busy: pathBusy, file }) {
       </div>
 
       <div className="stage">
-        {!path && <p className="empty">{pathBusy ? "Planning the tool path…" : "Select a program in Files to preview what it cuts."}</p>}
+        {!path && <p className="empty">{pathBusy ? "Planning the tool path…" : err || "Select a program in Files to preview what it cuts."}</p>}
         <div className="canvases" style={{ visibility: path ? "visible" : "hidden" }}>
           <canvas ref={depthRef} /><canvas ref={markRef} className="marker" />
         </div>

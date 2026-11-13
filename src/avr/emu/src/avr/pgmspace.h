@@ -35,6 +35,8 @@
 #define printf_P printf
 #define puts_P puts
 #define sprintf_P sprintf
+#define snprintf_P snprintf
+#define vsnprintf_P vsnprintf
 #define strcmp_P strcmp
 #define pgm_read_ptr(x) *(x)
 #define pgm_read_word(x) *(x)

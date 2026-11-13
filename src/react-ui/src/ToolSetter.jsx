@@ -19,6 +19,9 @@ export async function getSetter() {
 export const saveSetter = (s) => setPrefs({ setter: s });
 
 // Runs a setter program and resolves with the controller state when it ends.
+// The promise always settles: a program that never starts (the send failed, or the cycle
+// never left idle) resolves with {notStarted: true} instead of hanging the caller's dialog
+// in its busy step forever — the same failure ProbeDialog's 8 s watcher guards against.
 export function useProgramRunner(state, subscribe, send) {
   const R = useRef({ state });
   R.current.state = state;
@@ -27,19 +30,25 @@ export function useProgramRunner(state, subscribe, send) {
     if (d.log?.msg === "Switch not found" && r.running) r.notFound = true;
     // 1.34.2: an E-stop never brings the cycle back to idle, so finish on it too (the screen
     // used to sit on the running step with no message). "Switch not found" arrives just before it.
-    if (d.xx === "ESTOPPED" && r.running) {
-      r.running = false;
-      setTimeout(() => r.resolve({ ...R.current.state, notFound: r.notFound, estop: true }), 400);
-      return;
-    }
+    if (d.xx === "ESTOPPED" && r.running) { r.finish({ estop: true }); return; }
     if (d.cycle !== undefined && r.running) {
       if (d.cycle !== "idle") r.started = true;
-      else if (r.started) { r.running = false; setTimeout(() => r.resolve({ ...R.current.state, notFound: r.notFound }), 400); }
+      else if (r.started) r.finish({});
     }
   }), [subscribe]);
   return (prog) => new Promise((resolve) => {
-    Object.assign(R.current, { running: true, started: false, notFound: false, resolve });
-    send(prog);
+    const r = R.current;
+    if (r.startTimer) { clearTimeout(r.startTimer); r.startTimer = null; }
+    Object.assign(r, { running: true, started: false, notFound: false, resolve });
+    r.finish = (extra) => {
+      if (!r.running) return;
+      r.running = false;
+      if (r.startTimer) { clearTimeout(r.startTimer); r.startTimer = null; }
+      // A short delay so the state the program left behind has arrived before callers read it.
+      setTimeout(() => resolve({ ...R.current.state, notFound: r.notFound, ...(extra || {}) }), 400);
+    };
+    if (send(prog) === false) { r.finish({ notStarted: true }); return; }
+    r.startTimer = setTimeout(() => { if (r.running && !r.started) r.finish({ notStarted: true }); }, 8000);
   });
 }
 
@@ -122,6 +131,7 @@ export default function ToolSetter({ config, state, send, subscribe, metric, onC
     const res = await run(setterProgram(setterArgs(state, config, s, mode === "calib" ? "ref" : mode, s.ref?.ref)));
     local.current = false;
     await uiPatch("setter", { busy: "" }).catch(() => {});
+    if (res.notStarted) { setMsg({ ok: false, text: "The program never started — the controller didn't take it, most likely because the connection dropped. Nothing was saved. Check the connection and try again." }); return; }
     if (res.notFound) { setMsg({ ok: false, text: "A touch found nothing, so the controller stopped with an emergency stop (it always does when a probe move misses). Either the tool didn't reach the setter, or something else tripped the fast touch, such as a finger on the plunger, and the slow touch then found nothing. Nothing was saved. Clear the E-stop, home, check the setter position and try again." }); return; }
     if (res.estop) { setMsg({ ok: false, text: "Stopped by the E-stop. Nothing was saved. Clear the E-stop, home, and try again." }); return; }
     if (res.ofs_ok !== 1) { setMsg({ ok: false, text: SETTER_FAILS[res.ofs_fail] || "The setter routine didn't finish. Z zero was not changed." }); return; }

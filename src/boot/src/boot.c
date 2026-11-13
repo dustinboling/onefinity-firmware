@@ -152,14 +152,25 @@ uint8_t BlockLoad(unsigned size, uint8_t mem, uint32_t *address) {
 
     } else buffer[i] = 0xff;
 
+  // Bounds checks (audit Scripts-10): the block commands take their
+  // address from the unauthenticated serial protocol, so validate
+  // every target range *before* writing.  The page-write command
+  // (CMD_WRITE_PAGE) already refuses writes at or past the end of
+  // the application section; BlockLoad must not be a way around it --
+  // overwriting the bootloader section is the one failure that
+  // cannot be recovered over serial.
   switch (mem) {
   case MEM_EEPROM:
+    if (*address + size > (uint32_t)E2END + 1) return REPLY_ERROR;
     eeprom_write_block(buffer, (uint8_t *)(uint16_t)*address, size);
     *address += size;
     break;
 
   case MEM_FLASH:
     // NOTE: Flash programming, address is given in words.
+    // Reject any block that starts in or extends past the
+    // application section (byte end = word address * 2 + size).
+    if ((*address << 1) + size > APP_SECTION_SIZE) return REPLY_ERROR;
     SP_LoadFlashPage(buffer);
     SP_EraseWriteApplicationPage(*address << 1);
     *address += size >> 1;
@@ -167,6 +178,8 @@ uint8_t BlockLoad(unsigned size, uint8_t mem, uint32_t *address) {
     break;
 
   case MEM_USERSIG:
+    // The user signature row is exactly one page.
+    if (size > SPM_PAGESIZE) return REPLY_ERROR;
     SP_LoadFlashPage(buffer);
     SP_EraseUserSignatureRow();
     nvm_wait();

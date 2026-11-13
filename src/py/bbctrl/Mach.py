@@ -382,6 +382,20 @@ class Mach(Comm):
 
 
     def jog(self, axes):
+        # P-15: validate BEFORE _begin_cycle.  A malformed value used
+        # to raise in Cmd.jog's struct.pack after the jogging cycle had
+        # already been entered, stranding the state mid-transition.
+        clean = {}
+        for a in 'xyzabc':
+            if a in axes:
+                try: v = float(axes[a])
+                except (TypeError, ValueError):
+                    raise Exception('Bad jog value for axis %s' % a)
+                if not math.isfinite(v):
+                    raise Exception('Bad jog value for axis %s' % a)
+                clean[a] = max(-1.0, min(1.0, v))
+        axes = clean
+
         self._begin_cycle('jogging')
         self.planner.position_change()
 
@@ -666,9 +680,10 @@ class Mach(Comm):
 
 
     def step(self):
-        raise Exception('NYI') # TODO
-        if self._get_cycle() != 'running': self.start()
-        else: super().i2c_command(Cmd.UNPAUSE)
+        # P-22: not implemented; the unreachable start/unpause code
+        # that used to sit below the raise is gone.  The API answers
+        # 501 (StepHandler) rather than calling this.
+        raise NotImplementedError('Step is not implemented')
 
 
     def stop(self):
@@ -718,10 +733,14 @@ class Mach(Comm):
 
 
     def override_feed(self, override):
+        # P-14: defence in depth — clamp at the machine boundary too,
+        # so no caller can push an arbitrary-magnitude override.
+        override = max(0.0, min(2.0, float(override)))
         self._i2c_set('fo', int(1000 * override))
 
 
     def override_speed(self, override):
+        override = max(0.0, min(2.0, float(override)))
         self._i2c_set('so', int(1000 * override))
 
 

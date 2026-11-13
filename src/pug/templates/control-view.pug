@@ -37,6 +37,14 @@ script#control-view-template(type="text/x-template")
       div(slot="footer")
         button.pure-button.button-error(@click="GCodeNotFound=false")
           | OK
+
+    message(:show.sync="toolpathError")
+      h3(slot="header") Could not process file
+      div(slot="body")
+          p The controller could not finish simulating the file you selected. It may be too large or damaged, or the controller may be busy. Try selecting it again.
+      div(slot="footer")
+        button.pure-button.button-error(@click="toolpathError=false")
+          | OK
     
     message(:show.sync="show_probe_dialog")
       h3(slot="header") Probe Rotary

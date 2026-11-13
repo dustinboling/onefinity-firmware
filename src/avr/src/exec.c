@@ -40,18 +40,27 @@
 #include "config.h"
 #include "SCurve.h"
 
+#include <util/atomic.h>
+
 
 static struct {
-  exec_cb_t cb;
+  // AVR-12: cb and the scalar motion state below are shared between
+  // the LO exec ISR, other interrupt contexts and the main loop (var
+  // getters).  They are volatile so the compiler cannot cache them
+  // across contexts.  position[] is written in the LO ISR and read from
+  // the main loop; its accessors copy it under ATOMIC_BLOCK
+  // (exec_get_position()/exec_get_axis_position()).  The seg fields are
+  // owned by the LO exec context (exec_segment/_segment_exec).
+  volatile exec_cb_t cb;
 
   float position[AXES];
-  float velocity;
-  float accel;
-  float jerk;
-  float peak_vel;
-  float peak_accel;
+  volatile float velocity;
+  volatile float accel;
+  volatile float jerk;
+  volatile float peak_vel;
+  volatile float peak_accel;
 
-  float feed_override;
+  volatile float feed_override;
 
   struct {
     float target[AXES];
@@ -72,6 +81,25 @@ static void _limit_switch_cb(switch_id_t sw, bool active) {
 }
 
 
+static bool _limit_switch_active() {
+  // AVR-8: poll for an already-tripped limit.  The callback above only
+  // fires on a switch *transition* while moving, so a limit that is
+  // already active when motion starts (axis parked on its switch,
+  // switch held in by a crashed axis, restart after a hold) was
+  // invisible and the machine could be driven straight through it.
+  // The active seek switch is excluded: running into it is the point
+  // of a seek.
+  switch_id_t seek_sw = seek_get_switch();
+
+  for (int sw = SW_MIN_0; sw <= SW_MAX_3; sw++)
+    if ((switch_id_t)sw != seek_sw && switch_is_enabled((switch_id_t)sw) &&
+        switch_is_active((switch_id_t)sw))
+      return true;
+
+  return false;
+}
+
+
 void exec_init() {
   memset(&ex, 0, sizeof(ex));
   ex.feed_override = 1; // TODO implement feed override
@@ -83,11 +111,18 @@ void exec_init() {
 
 
 void exec_get_position(float p[AXES]) {
-  memcpy(p, ex.position, sizeof(ex.position));
+  // AVR-12: ex.position[] is updated by the LO exec ISR; copy it
+  // atomically so a main-loop reader cannot observe a torn vector.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    memcpy(p, ex.position, sizeof(ex.position));
 }
 
 
-float exec_get_axis_position(int axis) {return ex.position[axis];}
+float exec_get_axis_position(int axis) {
+  float p;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) p = ex.position[axis];
+  return p;
+}
 
 
 void exec_set_velocity(float v) {
@@ -96,7 +131,12 @@ void exec_set_velocity(float v) {
 }
 
 
-float exec_get_velocity() {return ex.velocity;}
+float exec_get_velocity() {
+  // AVR-12: single-float snapshot, taken atomically (see above)
+  float v;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) v = ex.velocity;
+  return v;
+}
 
 
 void exec_set_acceleration(float a) {
@@ -105,11 +145,19 @@ void exec_set_acceleration(float a) {
 }
 
 
-float exec_get_acceleration() {return ex.accel;}
+float exec_get_acceleration() {
+  float a;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) a = ex.accel;
+  return a;
+}
 void exec_set_jerk(float j) {ex.jerk = j;}
 
 
-void exec_set_cb(exec_cb_t cb) {ex.cb = cb;}
+void exec_set_cb(exec_cb_t cb) {
+  // AVR-12: two-byte pointer written from main-loop and LO contexts;
+  // store it atomically so the LO ISR never calls a torn pointer.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) ex.cb = cb;
+}
 
 
 void exec_move_to_target(const float target[]) {
@@ -145,8 +193,10 @@ stat_t _segment_exec() {
     a = SCurve::nextAccel(SEGMENT_TIME, 0, ex.velocity, ex.accel,
                           ex.seg.max_accel, ex.seg.max_jerk);
     v = ex.velocity + SEGMENT_TIME * a;
-    t *= ex.seg.vel / v;
 
+    // AVR-16: take the stopped path *before* dividing by v; v crosses
+    // zero during deceleration and float division by zero here produced
+    // inf/NaN segment times exactly while the operator was stopping.
     if (v < MIN_VELOCITY || seek_switch_found()) {
       t = v = 0;
       ex.seg.cb = 0;
@@ -154,7 +204,8 @@ stat_t _segment_exec() {
       state_holding();
       seek_end();
       spindle_update_speed();
-    }
+
+    } else t *= ex.seg.vel / v;
   }
 
   // Wait for next seg if time is too short and we are still moving
@@ -192,7 +243,11 @@ stat_t _segment_exec() {
 
     // Update time
     if (t == ex.seg.time) ex.seg.time -= SEGMENT_TIME;
-    else ex.seg.time -= SEGMENT_TIME * v / ex.seg.vel;
+    // AVR-16: ex.seg.vel can be 0 (zero-velocity segment); dividing by
+    // it made ex.seg.time NaN and the segment bookkeeping never
+    // converged.  With no segment velocity there is no scaling to do.
+    else if (ex.seg.vel) ex.seg.time -= SEGMENT_TIME * v / ex.seg.vel;
+    else ex.seg.time -= SEGMENT_TIME;
   }
 
   // Check switch
@@ -210,10 +265,20 @@ stat_t exec_segment(float time, const float target[], float vel, float accel,
   const float stepT = 1.0 / 60000; // 1ms in mins
   float t = 0.5 / 60000; // 0.5ms in mins
   unsigned j = 0;
-  for (unsigned i = 0; t < nextT && j < POWER_MAX_UPDATES; i++) {
+  // AVR-6: i is the write index, so it must be bounded by the array size
+  // (2 * POWER_MAX_UPDATES), not just by j.  A larger than expected
+  // residual segment time otherwise writes past power_updates[] into
+  // ex.seg.cb and the following exec state.
+  for (unsigned i = 0; t < nextT && j < POWER_MAX_UPDATES &&
+         i < 2 * POWER_MAX_UPDATES; i++) {
     if (ex.seg.time < t) ex.seg.power_updates[i] = power_updates[j++];
     t += stepT;
   }
+
+  // Power updates remain that could not be placed within the window:
+  // the segment time is far outside what the planner should produce.
+  if (j < POWER_MAX_UPDATES && t < nextT && ex.seg.time < t)
+    estop_trigger(STAT_LONG_SEG_TIME);
 
   copy_vector(ex.seg.target, target);
   ex.seg.time = nextT;
@@ -241,18 +306,40 @@ stat_t exec_next() {
   if (state_get() == STATE_HOLDING) return STAT_NOP;
   if (!ex.cb && !command_exec()) return STAT_NOP; // Queue empty
   if (!ex.cb) return STAT_AGAIN; // Non-exec command
+
+  // AVR-8: never start or continue a move while a non-seek limit switch
+  // is already tripped, regardless of velocity.  Returning the status
+  // lets the stepper ISR raise the estop.  Checked only when a move is
+  // actually about to execute, so an idle machine parked on a switch
+  // can still receive commands (e.g. a seek, whose switch is excluded).
+  if (_limit_switch_active()) return STAT_ESTOP_SWITCH;
+
   return ex.cb(); // Exec
 }
 
 
 // Variable callbacks
-float get_axis_position(int axis) {return ex.position[axis];}
-float get_velocity() {return ex.velocity / VELOCITY_MULTIPLIER;}
-float get_acceleration() {return ex.accel / ACCEL_MULTIPLIER;}
-float get_jerk() {return ex.jerk / JERK_MULTIPLIER;}
-float get_peak_vel() {return ex.peak_vel / VELOCITY_MULTIPLIER;}
+float get_axis_position(int axis) {return exec_get_axis_position(axis);}
+float get_velocity() {return exec_get_velocity() / VELOCITY_MULTIPLIER;}
+float get_acceleration() {
+  return exec_get_acceleration() / ACCEL_MULTIPLIER;
+}
+float get_jerk() {
+  float j;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) j = ex.jerk;
+  return j / JERK_MULTIPLIER;
+}
+float get_peak_vel() {
+  float v;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) v = ex.peak_vel;
+  return v / VELOCITY_MULTIPLIER;
+}
 void set_peak_vel(float x) {ex.peak_vel = 0;}
-float get_peak_accel() {return ex.peak_accel / ACCEL_MULTIPLIER;}
+float get_peak_accel() {
+  float a;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) a = ex.peak_accel;
+  return a / ACCEL_MULTIPLIER;
+}
 void set_peak_accel(float x) {ex.peak_accel = 0;}
 uint16_t get_feed_override() {return ex.feed_override * 1000;}
 void set_feed_override(uint16_t value) {ex.feed_override = value / 1000.0;}
@@ -270,7 +357,9 @@ stat_t command_set_axis(char *cmd) {
 
   // Decode axis
   int axis = axis_get_id(*cmd++);
-  if (axis < 0) return STAT_INVALID_ARGUMENTS;
+  // AVR-2: axis_get_id() returns 6..8 for U/V/W, but there are only AXES
+  // axes.  Accepting them writes past cmd.position[]/ex.position[].
+  if (axis < 0 || AXES <= axis) return STAT_INVALID_ARGUMENTS;
 
   // Decode position
   float position;
@@ -295,6 +384,10 @@ unsigned command_set_axis_size() {return sizeof(set_axis_t);}
 
 void command_set_axis_exec(void *data) {
   set_axis_t *cmd = (set_axis_t *)data;
+
+  // AVR-2: defence in depth, in case a queued command was crafted by
+  // another path than command_set_axis().
+  if (AXES <= cmd->axis) return;
 
   // Update exec
   ex.position[cmd->axis] = cmd->position;

@@ -62,7 +62,12 @@ static void _i2c_end_command() {
 
 
 static void _i2c_command_byte(uint8_t byte) {
-  i2c.data[i2c.length++] = byte;
+  // AVR-1: drop bytes once the buffer is full.  Without this check a long
+  // I2C transaction overruns data[] and corrupts adjacent state in
+  // interrupt context.  length can now never exceed I2C_MAX_DATA, so the
+  // NUL write in _i2c_end_command() (data[] has I2C_MAX_DATA + 1 bytes)
+  // is always in bounds.
+  if (i2c.length < I2C_MAX_DATA) i2c.data[i2c.length++] = byte;
 }
 
 

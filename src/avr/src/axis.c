@@ -62,7 +62,12 @@ int axis_get_id(char axis) {
 }
 
 
-int axis_get_motor(int axis) {return motor_map[axis];}
+int axis_get_motor(int axis) {
+  // AVR-2: motor_map[] has AXES entries; axis_get_id() can return 6..8
+  // for U/V/W.  Never index the map with an out-of-range axis.
+  if (axis < 0 || AXES <= axis) return -1;
+  return motor_map[axis];
+}
 
 
 bool axis_get_homed(int axis) {

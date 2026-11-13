@@ -168,20 +168,36 @@ class Checkpoint(object):
         if extra: rec.update(extra)
 
         self.current = rec
-        with self.lock: self.latest = rec
-        if not self.writing:
+        self._enqueue(rec)
+
+
+    def _enqueue(self, rec):
+        # P-07: the check-and-set of `writing` happens under the lock.
+        # The old code tested and set it unsynchronised, so a record
+        # queued while the writer was on its way out saw writing == True,
+        # started no thread, and was orphaned — typically the final
+        # 'stopped'/'estop' record Resume depends on.
+        with self.lock:
+            self.latest = rec
+            if self.writing: return
             self.writing = True
-            threading.Thread(target = self._writer, daemon = True).start()
+        threading.Thread(target = self._writer, daemon = True).start()
 
 
     def _writer(self):
-        try:
-            while True:
-                with self.lock:
-                    rec, self.latest = self.latest, None
-                if rec is None: break
+        while True:
+            with self.lock:
+                rec, self.latest = self.latest, None
+                if rec is None:
+                    # Clear the flag under the lock, having just seen
+                    # there is nothing queued: a record enqueued after
+                    # this point starts a fresh writer.
+                    self.writing = False
+                    return
+            try:
                 self._persist(rec)
-        finally: self.writing = False
+            except Exception:
+                self.log.exception('Checkpoint writer failed')
 
 
     def _persist(self, rec):
@@ -203,31 +219,25 @@ class Checkpoint(object):
 
 
     # Actions ------------------------------------------------------------
-    def mark(self, status):
-        # Re-save the newest record with a different status, e.g. 'parked'
+    def _resave(self, status):
+        # Re-save the newest record with a different status, through the
+        # same single enqueue path as _record (P-07).
         if not self.current: return
         with self.lock:
             self.seq += 1
             seq = self.seq
         rec = dict(self.current, seq = seq, t = int(time.time()), status = status)
         self.current = rec
-        with self.lock: self.latest = rec
-        if not self.writing:
-            self.writing = True
-            threading.Thread(target = self._writer, daemon = True).start()
+        self._enqueue(rec)
+
+
+    def mark(self, status):
+        # Re-save the newest record with a different status, e.g. 'parked'
+        self._resave(status)
 
 
     def dismiss(self):
         # The operator has seen the interrupted job and does not want to
         # resume it.
         if self.current and self.current.get('status') != 'dismissed':
-            with self.lock:
-                self.seq += 1
-                seq = self.seq
-            rec = dict(self.current, seq = seq, t = int(time.time()),
-                       status = 'dismissed')
-            self.current = rec
-            with self.lock: self.latest = rec
-            if not self.writing:
-                self.writing = True
-                threading.Thread(target = self._writer, daemon = True).start()
+            self._resave('dismissed')

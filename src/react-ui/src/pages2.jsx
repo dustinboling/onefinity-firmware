@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useDrops, clearDrops } from "./drops.js";
 import { getPrefs, setPrefs, useCheckpoint, isInterrupted } from "./checkpoint.js";
-import { api, MACRO_PREFIX, DELETE_LIST_PREFIX } from "./controller.js";
+import { api, apiFetch, MACRO_PREFIX, DELETE_LIST_PREFIX } from "./controller.js";
 import { Page, Group, Modal, Confirm, SubTabs } from "./ui.jsx";
 import { PlugPrefs } from "./Plugs.jsx";
 
@@ -72,7 +72,7 @@ export function Macros({ cfg, state }) {
     const nonMacro = (state.non_macros_list || []).map((x) => x.file_name);
     const toDelete = (state.macros_list || []).filter((x) => !nonMacro.includes(x.file_name)).map((x) => x.file_name);
     try {
-      if (toDelete.length) await api.del(`file/${DELETE_LIST_PREFIX}${toDelete.join(",")}`);
+      if (toDelete.length) await api.del(`file/${DELETE_LIST_PREFIX}${toDelete.map((n) => encodeURIComponent(n)).join(",")}`);
       await cfg.save((c) => { c.macros = DEFAULTS.map((d) => ({ ...d })); c.macros_list = []; });
       await open(-1);
     } catch (e) { setMsg(e.message); }
@@ -217,10 +217,10 @@ function General({ cfg, ver, state }) {
     try { await api.put("time", { datetime }); setNote("Date and time updated."); loadTime(); } catch (e) { setNote(`Update failed: ${e.message}`); }
   };
 
-  const backup = () => { const names = (state.macros || []).filter((m) => m.file_name !== "default").map((m) => m.file_name).join(","); const a = document.createElement("a"); a.href = `/api/config/download/${names}`; a.click(); };
+  const backup = () => { const names = (state.macros || []).filter((m) => m.file_name !== "default").map((m) => encodeURIComponent(m.file_name)).join(","); const a = document.createElement("a"); a.href = `/api/config/download/${names}`; a.click(); };
   const doRestore = async (f) => {
     if (!f) return; const fd = new FormData(); fd.append("zipfile", f);
-    try { const r = await fetch("/api/config/restore", { method: "PUT", body: fd, headers: { Type: "zip" } }); if (!r.ok) throw new Error(await r.text()); setNote("Configuration restored."); await cfg.reload(true); } catch (e) { setNote(`Restore failed: ${e.message}`); }
+    try { const r = await apiFetch("config/restore", { method: "PUT", body: fd, headers: { Type: "zip" } }); if (!r.ok) throw new Error(await r.text()); setNote("Configuration restored."); await cfg.reload(true); } catch (e) { setNote(`Restore failed: ${e.message}`); }
   };
   const doReset = async () => {
     setDlg(null);

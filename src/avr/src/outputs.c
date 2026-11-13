@@ -120,7 +120,9 @@ void outputs_set_mode(uint8_t pin, output_mode_t mode) {
 
 output_state_t outputs_get_state(uint8_t pin) {
   output_t *output = _get_output(pin);
-  if (output) return OUT_TRI;
+  // AVR-19: the branches were inverted: valid pins always reported
+  // OUT_TRI and invalid pins dereferenced the NULL from _get_output().
+  if (!output) return OUT_TRI;
   return output->state;
 }
 

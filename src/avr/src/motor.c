@@ -45,6 +45,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 
 typedef struct {
@@ -125,6 +126,14 @@ static uint8_t _dummy;
 static void _update_config(int motor) {
   motor_t *m = &motors[motor];
 
+  // AVR-13: never divide by a zero/negative/non-finite travel or step
+  // angle; that produced +/-inf or NaN steps_per_unit and poisoned the
+  // motion math.  Keep the previous (or initial zero) value until a
+  // valid configuration arrives.
+  if (!isfinite(m->travel_rev) || !isfinite(m->step_angle) ||
+      m->travel_rev <= 0 || m->step_angle <= 0)
+    return;
+
   m->steps_per_unit = 360.0 * m->microsteps / m->travel_rev / m->step_angle;
 }
 
@@ -178,7 +187,18 @@ int motor_get_axis(int motor) {return motors[motor].axis;}
 
 
 static int32_t _position_to_steps(int motor, float position) {
-  return (int32_t)round(position * motors[motor].steps_per_unit);
+  // AVR-7: converting an out-of-range float to int32_t is undefined
+  // behaviour.  Axis positions are host-settable to any finite float, so
+  // validate the scaled value, estop, and saturate instead.
+  float steps = position * motors[motor].steps_per_unit;
+
+  if (!isfinite(steps) || 2147483648.0f <= steps ||
+      steps < -2147483648.0f) {
+    estop_trigger(STAT_BAD_FLOAT);
+    return steps < 0 ? INT32_MIN : INT32_MAX;
+  }
+
+  return (int32_t)roundf(steps);
 }
 
 
@@ -291,7 +311,21 @@ void motor_prep_move(int motor, float target) {
 
   // Travel in steps
   int32_t position = _position_to_steps(motor, target);
-  int24_t steps = position - m.position;
+
+  // AVR-7: the delta was stored in int24_t, which wraps beyond
+  // +/-8,388,607 steps, flipping the distance (and possibly the
+  // direction) the motor is driven while m.position records the
+  // intended position.  Keep it in int32_t (computed in int64_t so the
+  // subtraction itself cannot overflow) and reject a delta one segment
+  // cannot execute, leaving headroom for the error correction below.
+  int64_t delta = (int64_t)position - m.position;
+  if (delta < (int64_t)INT32_MIN + 65536 ||
+      (int64_t)INT32_MAX - 65536 < delta) {
+    estop_trigger(STAT_INVALID_VALUE);
+    delta = delta < 0 ? (int64_t)INT32_MIN + 65536 :
+      (int64_t)INT32_MAX - 65536;
+  }
+  int32_t steps = (int32_t)delta;
   m.position = position;
 
   // Error correction
@@ -363,6 +397,8 @@ float get_step_angle(int motor) {return motors[motor].step_angle;}
 
 
 void set_step_angle(int motor, float value) {
+  // AVR-13: reject non-positive/non-finite divisors (see _update_config)
+  if (!isfinite(value) || value <= 0) return;
   if (motors[motor].slave) return;
 
   for (int m = motor; m < MOTORS; m++)
@@ -377,6 +413,8 @@ float get_travel(int motor) {return motors[motor].travel_rev;}
 
 
 void set_travel(int motor, float value) {
+  // AVR-13: reject non-positive/non-finite divisors (see _update_config)
+  if (!isfinite(value) || value <= 0) return;
   if (motors[motor].slave) return;
 
   for (int m = motor; m < MOTORS; m++)
@@ -425,23 +463,30 @@ void set_stall_microstep(int motor, uint16_t value) {
     }
 }
 
-void enable_stall_microstep(int m)
-{
-    //for (int m = 0; m < MOTORS; m++)
-    //{
-        motor_t *motorTemp = &motors[m];
-        motorTemp->steps_per_unit = 360.0 * motorTemp->stall_microsteps / motorTemp->travel_rev / motorTemp->step_angle;
-        drv8711_set_microsteps(m, motors[m].stall_microsteps);
-    //}
+void enable_stall_microstep(int m) {
+  // AVR-3: per-motor enable.  Only ever called from command_seek_exec(),
+  // i.e. when the seek actually executes, never at parse time.
+  if (m < 0 || MOTORS <= m) return;
+
+  motor_t *motorTemp = &motors[m];
+  if (!isfinite(motorTemp->travel_rev) || !isfinite(motorTemp->step_angle) ||
+      motorTemp->travel_rev <= 0 || motorTemp->step_angle <= 0)
+    return;
+
+  motorTemp->steps_per_unit = 360.0 * motorTemp->stall_microsteps /
+    motorTemp->travel_rev / motorTemp->step_angle;
+  drv8711_set_microsteps(m, motors[m].stall_microsteps);
 }
 
-void disable_stall_microstep()
-{
-    for(int m =0; m < MOTORS; m++)
-    {
-        _update_config(m);  //Restore the steps_per_unit
-        drv8711_set_microsteps(m, motors[m].microsteps);
-    }
+
+void disable_stall_microstep(int m) {
+  // AVR-3: restore only the motor that was switched to stall microsteps.
+  // The old no-argument version restored all motors at once, which could
+  // disturb an unrelated axis.
+  if (m < 0 || MOTORS <= m) return;
+
+  _update_config(m);  // Restore the steps_per_unit
+  drv8711_set_microsteps(m, motors[m].microsteps);
 }
 
 char get_motor_axis(int motor) {return motors[motor].axis;}

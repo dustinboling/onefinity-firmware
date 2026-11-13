@@ -108,7 +108,7 @@ module.exports = {
       }
       const file = this.fileName;
       if (file != "default") {
-        const response = await fetch(`/api/file/EgZjaHJvbWUqCggBEAAYsQMYgAQyBggAEEUYOTIKCAE${file}`, {
+        const response = await fetch(`/api/file/EgZjaHJvbWUqCggBEAAYsQMYgAQyBggAEEUYOTIKCAE${encodeURIComponent(file)}`, {
           cache: "no-cache",
         });
         if (response.status == 200) {

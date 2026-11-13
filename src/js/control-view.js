@@ -47,6 +47,7 @@ module.exports = {
       confirmDelete: false,
       create_folder: false,
       showGcodeMessage: false,
+      toolpathError: false,
       showNoGcodeMessage: false,
       macrosLoading: false,
       show_gcodes: false,
@@ -367,10 +368,22 @@ module.exports = {
       }
 
       this.showGcodeMessage = true;
+      this.toolpathError = false;
+
+      // Poll with a delay, back off while requests fail, and give up after 5 minutes:
+      // this used to re-issue the request as fast as each round trip returned, forever,
+      // flooding the controller while it was busy planning the path.
+      const deadline = Date.now() + 5 * 60 * 1000;
+      let failures = 0;
 
       while (this.showGcodeMessage) {
+        if (this.last_file_time != file_time) {
+          return; // A newer selection owns the message now
+        }
+
         try {
-          const toolpath = await api.get(`path/${file}`);
+          const toolpath = await api.get(`path/${encodeURIComponent(file)}`);
+          failures = 0;
           this.toolpath_progress = toolpath.progress;
 
           if (toolpath.progress === 1 || typeof toolpath.progress == "undefined") {
@@ -390,7 +403,22 @@ module.exports = {
           }
         } catch (error) {
           console.error(error);
+          failures++;
         }
+
+        if (!this.showGcodeMessage) {
+          break;
+        }
+
+        if (Date.now() > deadline || failures >= 20) {
+          this.showGcodeMessage = false;
+          this.toolpath_progress = 0;
+          this.toolpathError = true;
+          break;
+        }
+
+        const delay = failures ? Math.min(5000, 500 * Math.pow(2, Math.min(failures, 4))) : 500;
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     },
 

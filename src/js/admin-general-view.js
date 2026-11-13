@@ -139,13 +139,16 @@ module.exports = {
       formData.append("zipfile", files[0]);
 
       try {
-        await fetch("/api/config/restore", {
+        const response = await api.fetch("config/restore", {
           method: "PUT",
           body: formData,
           headers: {
             Type: "zip",
           },
         });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
         SvelteComponents.showDialog("Message", {
           title: "Success",
           message: "Configuration restored",

@@ -1,9 +1,25 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 // Top-down view of the tool path, shaded by cutting depth, with the live tool position.
-export default function PathView({ path, busy, state }) {
+export default function PathView({ path, busy, err, state }) {
   const ref = useRef(null);
   const geo = useRef(null);
+  // Re-run the sizing/draw effect when the stage changes size (touchscreen rotation,
+  // window resize, full screen): the canvases used to keep the pixel size from when the
+  // path loaded, so the path and the live marker no longer lined up.
+  const [sizeTick, setSizeTick] = useState(0);
+  useEffect(() => {
+    const parent = ref.current && ref.current.parentElement;
+    if (!parent) return undefined;
+    const bump = () => setSizeTick((n) => n + 1);
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", bump);
+      return () => window.removeEventListener("resize", bump);
+    }
+    const ro = new ResizeObserver(bump);
+    ro.observe(parent);
+    return () => ro.disconnect();
+  }, []);
   useEffect(() => {
     const c = ref.current; if (!c) return;
     const box = c.parentElement.getBoundingClientRect();
@@ -36,7 +52,7 @@ export default function PathView({ path, busy, state }) {
         ctx.stroke();
       }
     }
-  }, [path]);
+  }, [path, sizeTick]);
 
   useEffect(() => {
     const c = document.getElementById("path-live"); if (!c || !geo.current) return;
@@ -45,11 +61,11 @@ export default function PathView({ path, busy, state }) {
     const x = ((state.xp || 0) - (state.offset_x || 0)) * s + ox, y = oy - ((state.yp || 0) - (state.offset_y || 0)) * s;
     ctx.strokeStyle = "#f5c518"; ctx.lineWidth = 2 * devicePixelRatio;
     ctx.beginPath(); ctx.arc(x, y, 7 * devicePixelRatio, 0, 7); ctx.moveTo(x - 12 * devicePixelRatio, y); ctx.lineTo(x + 12 * devicePixelRatio, y); ctx.moveTo(x, y - 12 * devicePixelRatio); ctx.lineTo(x, y + 12 * devicePixelRatio); ctx.stroke();
-  }, [state.xp, state.yp, state.offset_x, state.offset_y, path]);
+  }, [state.xp, state.yp, state.offset_x, state.offset_y, path, sizeTick]);
 
   return (
     <div className="stage">
-      {!path && <p className="empty">{busy ? "Planning the tool path…" : "Select a program in Files to see its tool path."}</p>}
+      {!path && <p className="empty">{busy ? "Planning the tool path…" : err || "Select a program in Files to see its tool path."}</p>}
       <div className="canvases" style={{ visibility: path ? "visible" : "hidden", inset: 8 }}>
         <canvas ref={ref} className="smooth" /><canvas id="path-live" className="smooth marker" />
       </div>

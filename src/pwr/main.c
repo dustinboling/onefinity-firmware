@@ -30,6 +30,7 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <avr/io.h>
+#include <avr/wdt.h>
 
 #include <util/delay.h>
 
@@ -76,11 +77,36 @@ static volatile uint8_t motor_overload = 0;
 static volatile float shunt_joules = 0;
 static volatile bool initialized = false;
 static volatile float vnom = 0;
+// AVR-10: counts completed ADC conversions so the main loop can verify
+// the self-chaining ADC interrupt sequence is still advancing.
+static volatile uint32_t adc_conversions = 0;
+
+
+static uint64_t _time_now() {
+  // AVR-21: read the 64-bit ISR tick counter atomically (the pattern
+  // get_reg() already uses).  A plain read is eight byte loads on this
+  // MCU and can tear across a byte-carry while the timer ISR increments
+  // it, giving delay() an end time up to ~2^32 ms in error.
+  uint8_t sreg = SREG;
+  cli();
+  uint64_t now = time;
+  SREG = sreg;
+  return now;
+}
+
+
+static uint32_t _adc_conversions_now() {
+  uint8_t sreg = SREG;
+  cli();
+  uint32_t count = adc_conversions;
+  SREG = sreg;
+  return count;
+}
 
 
 void delay(uint16_t ms) {
-  uint64_t end = time + ms;
-  while (time < end) continue;
+  uint64_t end = _time_now() + ms;
+  while (_time_now() < end) continue;
 }
 
 
@@ -331,6 +357,8 @@ static void read_conversion(uint8_t ch) {
 static void adc_conversion() {
   static int i = 0;
 
+  adc_conversions++;
+
   read_conversion(ch_schedule[i]);
   if (++i == sizeof(ch_schedule)) i = 0;
 
@@ -394,6 +422,12 @@ static void shunt_test() {
 
 void init() {
   cli();
+
+  // AVR-10: if the watchdog caused this reset, stop it from resetting
+  // the board again before the supervisor is running (it is re-enabled
+  // in main() once startup has completed).
+  MCUSR = 0;
+  wdt_disable();
 
   // CPU Clock, disable CKOUT
   CCP   = 0xd8;
@@ -489,7 +523,36 @@ int main() {
   validate_measurements();
   initialized = true;
 
-  while (true) continue;
+  // AVR-10: supervise the protection chain.  Every protection this
+  // board provides (over-current, over/under-voltage, overloads) runs
+  // from the self-chaining ADC interrupt, and the old main loop was an
+  // empty spin with no watchdog: one missed conversion stopped all
+  // monitoring permanently while motor power stayed energised.
+  //
+  // Now: enable the watchdog, and feed it only while the ADC chain is
+  // verifiably advancing.  If a conversion is no longer in progress the
+  // chain has stalled, so try to restart it by consuming the pending
+  // result; if it does not resume, the watchdog resets the board (init
+  // leaves motor power off) instead of running unmonitored.
+  // Residual limitation: this is a software supervisor on the same MCU;
+  // it cannot help if the clock itself fails, and the ATtiny has no
+  // independent hardware watchdog separate from this one.
+  wdt_enable(WDTO_2S);
+
+  uint32_t last_count = _adc_conversions_now();
+
+  while (true) {
+    delay(100);
+
+    uint32_t count = _adc_conversions_now();
+
+    if (count != last_count) {
+      last_count = count;
+      wdt_reset(); // Protection chain is alive
+
+    } else if (!(ADCSRA & (1 << ADSC)))
+      adc_conversion(); // Chain stalled: restart it
+  }
 
   return 0;
 }

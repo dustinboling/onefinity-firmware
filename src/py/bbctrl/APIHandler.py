@@ -51,6 +51,7 @@ class APIHandler(bbctrl.RequestHandler):
 
 
     def prepare(self):
+        super().prepare() # P-01: admin gate in RequestHandler
         self.json = {}
 
         if self.request.body and self.request.headers.get('Type') != 'zip':

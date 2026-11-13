@@ -41,19 +41,38 @@ def read_intel_hex(f):
     start = 0
     chunk = None
 
-    for line in f:
+    for lineno, line in enumerate(f, 1):
         line = line.strip()
         if not line or line[0] != ':': continue
 
-        count = int(line[1:3], 16)
-        addr = int(line[3:7], 16)
-        type = int(line[7:9], 16)
-        data = line[9:-2]
-        checksum = int(line[-2:], 16)
+        # Validate the record before trusting any of it (Scripts-8):
+        # the record must be well-formed hex, its byte count must
+        # match its length, and its checksum -- the two's complement
+        # of the sum of all preceding bytes in the record -- must
+        # verify, so the sum of the whole record is zero mod 256.
+        try:
+            raw = binascii.unhexlify(bytes(line[1:], 'utf8'))
+        except Exception:
+            raise ValueError('line %d: not valid hex' % lineno)
+
+        if len(raw) < 5:
+            raise ValueError('line %d: record too short' % lineno)
+
+        count = raw[0]
+        addr = (raw[1] << 8) | raw[2]
+        type = raw[3]
+        data = raw[4:4 + count]
+        checksum = raw[4 + count] if len(raw) > 4 + count else None
+
+        if len(raw) != count + 5:
+            raise ValueError(
+                'line %d: byte count %d does not match record length %d'
+                % (lineno, count, len(raw) - 5))
+        if sum(raw) & 0xff != 0:
+            raise ValueError('line %d: checksum mismatch' % lineno)
 
         if type == 0:
             addr += base
-            data = binascii.unhexlify(bytes(data, 'utf8'))
 
             if chunk is None or pos != addr:
                 if chunk is not None: yield (start, chunk)
@@ -64,7 +83,14 @@ def read_intel_hex(f):
 
             pos = addr + len(data)
 
-        if type == 2: base = int(data, 16) * 16
+        elif type == 1: # End of file
+            break
+
+        elif type == 2: # Extended segment address
+            base = int.from_bytes(data, 'big') * 16
+
+        elif type == 4: # Extended linear address
+            base = int.from_bytes(data, 'big') << 16
 
     if chunk is not None: yield (start, chunk)
 
@@ -91,8 +117,14 @@ def recv_int(size):
     return x
 
 
-# Read firmware hex file
+if len(sys.argv) != 2:
+    sys.exit('Usage: %s <firmware.hex>' % sys.argv[0])
+
+# Read firmware hex file (record checksums are validated while
+# reading; a corrupt image is rejected here, before the AVR is
+# erased -- Scripts-8)
 data = list(read_intel_hex(open(sys.argv[1], 'r')))
+if not data: sys.exit('No data found in %s' % sys.argv[1])
 
 # Open serial  port
 sp = serial.Serial(dev, baud, timeout = 10)
@@ -127,6 +159,7 @@ minor = int(recv(1))
 print('Bootloader version: %d.%d' % (major, minor))
 
 # If bootloader is new enough compare checksums
+new_crc = None
 if 0 < major or 1 < minor:
     # Get flash length
     send('n')
@@ -201,6 +234,24 @@ for addr, chunk in data:
 
 print('done')
 print('Wrote %d bytes' % count)
+
+# Verify the finished flash (Scripts-8): ask the bootloader for the
+# CRC32 of the whole application section and compare it with the CRC
+# of the image we intended to write.  The per-block CRCs above only
+# prove the device received the bytes we sent; this proves the flash
+# now contains the image.  Bootloaders too old to report a CRC were
+# detected earlier (new_crc is None) and cannot be verified this way.
+if new_crc is not None:
+    send('X')
+    verified_crc = recv_int(4)
+    if verified_crc != new_crc:
+        raise Exception(
+            'Post-flash CRC mismatch: flash=0x%08x expected=0x%08x'
+            % (verified_crc, new_crc))
+    print('Flash verified: CRC32 0x%08x' % verified_crc)
+else:
+    print('WARNING: bootloader does not support CRC verification; '
+          'flash was not verified')
 
 # Exit bootloader
 send('E')

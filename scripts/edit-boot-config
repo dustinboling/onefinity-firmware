@@ -1,12 +1,39 @@
 #!/bin/bash
+#
+# edit-boot-config -- edit /boot/config.txt via edit-config.
+#
+# /boot is normally mounted read-only; it is remounted read-write
+# only for the copy back, the new file is synced to disk, and /boot
+# is always remounted read-only again -- including on failure
+# (audit Scripts-17).  A failing edit-config aborts the script.
 
-cp /boot/config.txt /tmp/
+set -euo pipefail
 
-edit-config /tmp/config.txt "$@"
+TMP_FILE="$(mktemp /tmp/config.txt.XXXXXXXX)"
+BOOT_RW=false
 
-diff /boot/config.txt /tmp/config.txt >/dev/null
-if [ $? -eq 1 ]; then
-  mount -o remount,rw /boot
-  mv /tmp/config.txt /boot/
-  mount -o remount,ro /boot
+cleanup() {
+    if $BOOT_RW; then
+        mount -o remount,ro /boot || true
+    fi
+    rm -f "$TMP_FILE"
+}
+trap cleanup EXIT
+
+cp /boot/config.txt "$TMP_FILE"
+
+# Check edit-config's result explicitly: under set -e any failure
+# aborts here and the trap leaves /boot read-only and untouched.
+edit-config "$TMP_FILE" "$@"
+
+if cmp -s /boot/config.txt "$TMP_FILE"; then
+    exit 0 # No change
 fi
+
+mount -o remount,rw /boot
+BOOT_RW=true
+cp "$TMP_FILE" /boot/config.txt
+sync
+mount -o remount,ro /boot
+BOOT_RW=false
+sync

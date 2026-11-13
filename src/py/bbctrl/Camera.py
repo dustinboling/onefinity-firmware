@@ -328,7 +328,10 @@ class Camera(object):
         self.last_frame_time = 0
         self.want_frames_until = 0
         self.fourcc = 'MJPG'
-        self.max_clients = args.camera_clients
+        # P-21: --camera-clients used to arrive as a string from the
+        # CLI, breaking the comparisons below; coerce defensively too.
+        try: self.max_clients = max(1, int(args.camera_clients))
+        except (TypeError, ValueError): self.max_clients = 4
 
         self.overtemp = False
         self.dev = None
@@ -559,8 +562,12 @@ class Camera(object):
     def add_client(self, client):
         self.log.info('Adding camera client: %d' % len(self.clients))
 
-        if self.max_clients <= len(self.clients):
-            self.clients[-self.max_clients].write_img('in-use')
+        # P-21: the cap used to be advisory — the new client was
+        # appended regardless and the list grew past max_clients on
+        # every reconnect storm.  At the cap, the oldest client is
+        # told the camera is in use and dropped to make room.
+        while self.clients and self.max_clients <= len(self.clients):
+            self.clients.pop(0).write_img('in-use')
 
         self.clients.append(client)
         self._update_client_image()

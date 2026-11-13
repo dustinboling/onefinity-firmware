@@ -22,6 +22,7 @@ export default function ControlPage({ ctl, cfg, mach, metric }) {
   const { state, send, subscribe, logs, clearLogs } = ctl;
   const [path, setPath] = useState(null);
   const [pathBusy, setPathBusy] = useState(false);
+  const [pathErr, setPathErr] = useState("");
   // Which probing tool is open is part of the shared session: every screen shows the same one.
   // "tool" holds {kind}; each tool keeps its own steps under its own name ("probe", "measure", "setter").
   const toolUi = useUi(state, "tool").v;
@@ -37,14 +38,20 @@ export default function ControlPage({ ctl, cfg, mach, metric }) {
   useEffect(() => {
     const f = state.selected;
     setPath(null);
-    if (!f) return;
-    let dead = false;
+    setPathErr("");
+    if (!f) return undefined;
+    // Changing the selection aborts the old plan poll instead of leaving it running.
+    const ac = new AbortController();
     setPathBusy(true);
-    loadPath(f).then((p) => !dead && setPath(p)).catch(() => {}).finally(() => !dead && setPathBusy(false));
-    return () => { dead = true; };
+    loadPath(f, ac.signal)
+      .then((p) => setPath(p))
+      .catch((e) => { if (e.name !== "AbortError") setPathErr("The controller couldn't plan this program — it may be too large or damaged. Try selecting it again."); })
+      .finally(() => { if (!ac.signal.aborted) setPathBusy(false); });
+    return () => ac.abort();
   }, [state.selected, state.selected_time]);
 
-  const lines = useProgram(state);
+  const prog = useProgram(state);
+  const lines = prog.lines;
   const ckpt = useCheckpoint(state);
   const changes = React.useMemo(() => parseToolChanges(lines), [lines]);
   const busy = mach === "RUNNING" || mach === "HOLDING" || mach === "STOPPING" || mach === "HOMING";
@@ -83,7 +90,7 @@ export default function ControlPage({ ctl, cfg, mach, metric }) {
       </section>
       <section className="band job-band"><Job state={state} mach={mach} path={path} metric={metric} config={cfg.config} changes={changes} /></section>
       <section className="band work-band">
-        <Workspace lines={lines} state={state} path={path} pathBusy={pathBusy} send={send} mach={mach} cfg={cfg} idle={idle && !estopped} logs={logs} clearLogs={clearLogs} subscribe={subscribe} onMeasure={() => setProbe("measure")} />
+        <Workspace lines={lines} tooLarge={prog.tooLarge} state={state} path={path} pathBusy={pathBusy} pathErr={pathErr} send={send} mach={mach} cfg={cfg} idle={idle && !estopped} logs={logs} clearLogs={clearLogs} subscribe={subscribe} onMeasure={() => setProbe("measure")} />
       </section>
       {homeFirst && (
         <Modal title="Home the machine first" onClose={homing ? undefined : () => setHomeFirst(null)} dismissable={!homing}
